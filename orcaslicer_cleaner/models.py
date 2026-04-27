@@ -28,6 +28,7 @@ class IssueType(enum.Enum):
     STALE_PROFILE = "stale_profile"
     MISSING_FIELD = "missing_field"
     NAMING_INCONSISTENCY = "naming_inconsistency"
+    BROKEN_INHERITS = "broken_inherits"
     DUPLICATE_SETTING_ID = "duplicate_setting_id"
 
 

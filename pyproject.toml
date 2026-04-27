@@ -17,4 +17,3 @@ dependencies = [
 ocs = "orcaslicer_cleaner.cli:cli"
 
 [tool.setuptools.packages.find]
-where = ["src"]

@@ -11,6 +11,7 @@ from .models import (
     ProfileCategory,
     ValidationIssue,
 )
+from .system_profiles import SystemProfileNames
 
 # Profiles older than this many days are considered stale
 DEFAULT_STALE_DAYS = 365
@@ -19,6 +20,7 @@ DEFAULT_STALE_DAYS = 365
 def validate_all(
     profiles: dict[ProfileCategory, list[Profile]],
     stale_days: int = DEFAULT_STALE_DAYS,
+    system_names: SystemProfileNames | None = None,
 ) -> list[ValidationIssue]:
     """Run all validation checks and return a list of issues."""
     issues: list[ValidationIssue] = []
@@ -26,11 +28,19 @@ def validate_all(
     all_profiles = [p for ps in profiles.values() for p in ps]
     machine_names = {p.name for p in profiles.get(ProfileCategory.MACHINE, [])}
 
+    # Build sets of user profile names per category for inherits checking
+    user_names_by_category: dict[ProfileCategory, set[str]] = {
+        cat: {p.name for p in profiles.get(cat, [])} for cat in ProfileCategory
+    }
+
     for profile in all_profiles:
         issues.extend(_check_orphaned(profile))
         issues.extend(_check_malformed_json(profile))
         issues.extend(_check_missing_fields(profile))
-        issues.extend(_check_broken_references(profile, machine_names))
+        issues.extend(_check_broken_references(profile, machine_names, system_names))
+        issues.extend(
+            _check_broken_inherits(profile, user_names_by_category, system_names)
+        )
         issues.extend(_check_stale(profile, stale_days))
 
     issues.extend(_check_duplicate_setting_ids(all_profiles))
@@ -120,14 +130,17 @@ def _check_missing_fields(profile: Profile) -> list[ValidationIssue]:
 
 
 def _check_broken_references(
-    profile: Profile, machine_names: set[str]
+    profile: Profile,
+    machine_names: set[str],
+    system_names: SystemProfileNames | None = None,
 ) -> list[ValidationIssue]:
-    """Check that compatible_printers and inherits reference existing profiles."""
+    """Check that compatible_printers references existing profiles."""
     issues: list[ValidationIssue] = []
 
     if profile.category in (ProfileCategory.FILAMENT, ProfileCategory.PROCESS):
+        system_machines = system_names.machine_names if system_names else set()
         for printer in profile.compatible_printers:
-            if printer and printer not in machine_names:
+            if printer and printer not in machine_names and printer not in system_machines:
                 issues.append(
                     ValidationIssue(
                         profile=profile,
@@ -139,6 +152,45 @@ def _check_broken_references(
                 )
 
     return issues
+
+
+def _check_broken_inherits(
+    profile: Profile,
+    user_names_by_category: dict[ProfileCategory, set[str]],
+    system_names: SystemProfileNames | None = None,
+) -> list[ValidationIssue]:
+    """Check that the inherits field references a valid profile."""
+    inherits = profile.inherits
+    if not inherits:
+        return []
+
+    # Check against user profiles in the same category
+    user_names = user_names_by_category.get(profile.category, set())
+    if inherits in user_names:
+        return []
+
+    # Check against system inherits targets (filename stems across all vendors)
+    # and system profile names (the "name" field in JSON, which OrcaSlicer also
+    # uses as inherits values)
+    if system_names:
+        if inherits in system_names.inherits_targets:
+            return []
+        if inherits in system_names.machine_names:
+            return []
+        if inherits in system_names.process_names:
+            return []
+        if inherits in system_names.filament_names:
+            return []
+
+    return [
+        ValidationIssue(
+            profile=profile,
+            issue_type=IssueType.BROKEN_INHERITS,
+            severity=IssueSeverity.ERROR,
+            message=f"Inherits non-existent profile '{inherits}'",
+            details=f"Profile '{profile.name}' inherits '{inherits}' which was not found",
+        )
+    ]
 
 
 def _check_stale(

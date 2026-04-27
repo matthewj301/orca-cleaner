@@ -51,6 +51,37 @@ ocs restore                                 # list available backups
 ocs restore <timestamp>                     # restore from backup
 ```
 
+## Domain Model
+
+- Filament profiles are hardware-specific: tuned per extruder + hotend combo.
+  Same material through different hardware = different profile, NOT a duplicate.
+- Process profiles are printer-specific but filament-agnostic: determined by
+  machine motion capability, not what filament is loaded.
+- Machine profiles define the printer with hardware: "PrinterModel - Extruder - Hotend - NozzleSize"
+
+## Key Paths (macOS)
+
+- User profiles: `~/Library/Application Support/OrcaSlicer/user/`
+- System profiles: `/Applications/OrcaSlicer.app/Contents/Resources/profiles/`
+- Backups: `~/Library/Application Support/OrcaSlicer/_backup/`
+- Override with `--profile-dir` and `--system-profiles` flags
+
+## Extension Points
+
+- Hardware aliases (cleaner.py `_HARDWARE_ALIASES`): maps abbreviations in profile
+  names to machine name terms for link matching (e.g., "mako" -> "bambu")
+- Name abbreviations (standardizer.py `_ABBREVIATIONS`): expanded during name
+  standardization (e.g., "TK" -> "TeaKettle")
+
+## Gotchas
+
+- `updated_time` in .info files is cloud sync time, not last-used time — stale
+  detection based on this is approximate
+- Empty `compatible_printers` in a profile JSON means OrcaSlicer shows it for
+  ALL printers — this is the most common link issue
+- The `standardizer.py` hyphen rule only touches hyphens with existing whitespace
+  on at least one side, preserving compound words like "V-Core" and "ASA-CF"
+
 ## Conventions
 
 - Python 3.11+

@@ -13,7 +13,7 @@ orcaslicer_cleaner/
   deduplicator.py - Fuzzy name matching (rapidfuzz) + content hash dedup
   reporter.py     - Rich tables/panels for terminal output + JSON export
   cleaner.py      - Backup/archive/delete/link-audit operations with dry-run support
-  standardizer.py - Name normalization (layer heights, hyphens, abbreviations, HW injection, machine rename cascade)
+  standardizer.py - Name normalization (layer heights, hyphens, abbreviations, HW injection, machine rename cascade, process model-naming)
   system_profiles.py - Read-only system profile name loader from OrcaSlicer app bundle
 ```
 
@@ -90,6 +90,11 @@ ocs restore <timestamp>                     # restore from backup
   profiles reference. The layer-height padding rule only applies to values at
   the START of a name (process profiles); nozzle sizes at the end are never
   padded. `ocs scan` flags mismatches as ERROR with a "did you mean?" suggestion.
+- Process profiles are broadened to ALL machine variants of a given model+nozzle
+  when renamed. E.g., renaming to `(Doomcube - 0.4mm)` sets compatible_printers
+  to both `Doomcube - LGX Lite Pro - TeaKettle - 0.4mm` and `Doomcube - WWBMG - TeaKettle - 0.4mm`.
+- When removing a broken compatible_printers reference leaves a profile with
+  empty `[]`, the profile must be archived — empty means "visible to ALL printers".
 
 ## Conventions
 

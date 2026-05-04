@@ -373,17 +373,23 @@ def execute_remap(
             _backup_json(profile_by_path[path], timestamped_backup)
             backed_up.add(path)
 
-        data["compatible_printers"] = printers
-
-        try:
-            path.write_text(
-                json.dumps(data, indent=4, ensure_ascii=False) + "\n",
-                encoding="utf-8",
-            )
-            console.print(f"  [green]Updated[/green] {path.name}")
+        if not printers:
+            # No remaining printers — archive the profile entirely
+            profile = profile_by_path[path]
+            _archive_profile(profile, timestamped_backup)
+            console.print(f"  [yellow]Archived[/yellow] {path.name} (no remaining printers)")
             modified += 1
-        except OSError as e:
-            console.print(f"  [red]Failed to write[/red] {path.name}: {e}")
+        else:
+            data["compatible_printers"] = printers
+            try:
+                path.write_text(
+                    json.dumps(data, indent=4, ensure_ascii=False) + "\n",
+                    encoding="utf-8",
+                )
+                console.print(f"  [green]Updated[/green] {path.name}")
+                modified += 1
+            except OSError as e:
+                console.print(f"  [red]Failed to write[/red] {path.name}: {e}")
 
     return modified
 
@@ -480,7 +486,7 @@ def _machine_matches_hardware(machine_name: str, hardware_hint: str) -> bool:
     # Token-based: ALL non-nozzle hint tokens must appear in machine
     nozzle_re = re.compile(r"^\d+\.?\d*mm$")
 
-    hint_tokens = {t.strip() for t in hint_lower.split("-") if t.strip()}
+    hint_tokens = {t.strip() for t in re.split(r"[-,]", hint_lower) if t.strip()}
     hint_tokens = {t for t in hint_tokens if not nozzle_re.match(t)}
 
     machine_tokens = {t.strip() for t in machine_lower.split("-") if t.strip()}

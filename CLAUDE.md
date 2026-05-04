@@ -9,11 +9,11 @@ orcaslicer_cleaner/
   cli.py          - Click CLI entry point (commands: scan, clean, fix, diff, restore)
   models.py       - Data models (Profile, ProfileInfo, ValidationIssue, DuplicateGroup)
   loader.py       - Discovers and parses .info/.json profile pairs from disk
-  validators.py   - Validation checks (orphans, broken refs, stale, malformed JSON)
+  validators.py   - Validation checks (orphans, broken refs w/ near-match suggestion, stale, malformed JSON)
   deduplicator.py - Fuzzy name matching (rapidfuzz) + content hash dedup
   reporter.py     - Rich tables/panels for terminal output + JSON export
   cleaner.py      - Backup/archive/delete/link-audit operations with dry-run support
-  standardizer.py - Name normalization (layer heights, hyphens, abbreviations, HW injection)
+  standardizer.py - Name normalization (layer heights, hyphens, abbreviations, HW injection, machine rename cascade)
   system_profiles.py - Read-only system profile name loader from OrcaSlicer app bundle
 ```
 
@@ -81,6 +81,13 @@ ocs restore <timestamp>                     # restore from backup
   ALL printers — this is the most common link issue
 - The `standardizer.py` hyphen rule only touches hyphens with existing whitespace
   on at least one side, preserving compound words like "V-Core" and "ASA-CF"
+- Renaming a machine profile breaks all filament/process profiles that reference
+  it via `compatible_printers` (exact string match). The standardizer handles this
+  automatically by processing machines first and cascading to dependent profiles.
+- Nozzle sizes in machine names (`0.4mm`) must match exactly what filament
+  profiles reference. The layer-height padding rule only applies to values at
+  the START of a name (process profiles); nozzle sizes at the end are never
+  padded. `ocs scan` flags mismatches as ERROR with a "did you mean?" suggestion.
 
 ## Conventions
 
@@ -90,3 +97,7 @@ ocs restore <timestamp>                     # restore from backup
 - Always back up before deleting (archive to _backup/ directory)
 - Default to dry-run for any destructive operation
 - User's live profiles at ~/Library/Application Support/OrcaSlicer/user/ — never modify without explicit consent
+- Machine profiles must be renamed before filament/process profiles to preserve
+  compatible_printers integrity (standardizer enforces this ordering)
+- Broken compatible_printers references are ERROR severity — they cause functional
+  breakage in OrcaSlicer (filaments become "incompatible")

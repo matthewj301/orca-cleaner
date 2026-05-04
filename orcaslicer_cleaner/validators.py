@@ -141,17 +141,37 @@ def _check_broken_references(
         system_machines = system_names.machine_names if system_names else set()
         for printer in profile.compatible_printers:
             if printer and printer not in machine_names and printer not in system_machines:
+                suggestion = _find_near_match(printer, machine_names | system_machines)
+                detail = f"Profile '{profile.name}' lists '{printer}' in compatible_printers"
+                if suggestion:
+                    detail += f" (did you mean '{suggestion}'?)"
                 issues.append(
                     ValidationIssue(
                         profile=profile,
                         issue_type=IssueType.BROKEN_REFERENCE,
-                        severity=IssueSeverity.WARNING,
+                        severity=IssueSeverity.ERROR,
                         message=f"References non-existent printer '{printer}'",
-                        details=f"Profile '{profile.name}' lists '{printer}' in compatible_printers",
+                        details=detail,
                     )
                 )
 
     return issues
+
+
+def _find_near_match(name: str, candidates: set[str]) -> str | None:
+    """Find a likely match for a broken printer reference (e.g. trailing zero differences)."""
+    import re
+    normalized = re.sub(r"(\d+\.\d)0+(mm)", r"\1\2", name)
+    if normalized != name and normalized in candidates:
+        return normalized
+    padded = re.sub(r"(\d+\.)(\d)(mm)", r"\1\g<2>0\3", name)
+    if padded != name and padded in candidates:
+        return padded
+    name_lower = name.lower()
+    for candidate in candidates:
+        if candidate.lower() == name_lower:
+            return candidate
+    return None
 
 
 def _check_broken_inherits(

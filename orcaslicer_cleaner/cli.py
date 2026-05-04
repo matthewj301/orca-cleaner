@@ -138,6 +138,18 @@ def scan(ctx: click.Context, json_output: bool, stale_days: int, min_severity: s
             title="Link Audit",
         ))
 
+        if empty_links:
+            from rich.table import Table as RichTable
+            table = RichTable(title="Visible to ALL printers (empty compatible_printers)")
+            table.add_column("Profile", max_width=60)
+            table.add_column("Suggested Printer(s)", style="green")
+            for link in sorted(empty_links, key=lambda l: l.profile.name):
+                table.add_row(
+                    link.profile.name,
+                    ", ".join(link.suggested_printers) if link.suggested_printers else "?",
+                )
+            console.print(table)
+
     # Naming issues
     rename_actions = find_renames(profiles)
     if rename_actions:
@@ -222,6 +234,117 @@ def clean(
 
     count = execute_actions(console, actions, backup_dir)
     console.print(f"\n[green]Done. {count}/{len(actions)} actions completed.[/green]")
+
+
+# ---------------------------------------------------------------------------
+# remove-printer — delete a machine and its dependent profiles
+# ---------------------------------------------------------------------------
+
+
+@cli.command("remove-printer")
+@click.option("--backup-dir", type=click.Path(path_type=Path), default=None, help="Directory to archive removed profiles.")
+@click.pass_context
+def remove_printer(ctx: click.Context, backup_dir: Path | None) -> None:
+    """Remove a printer and archive all filament/process profiles exclusively linked to it."""
+    profile_dir: Path = ctx.obj["profile_dir"]
+    profiles = _load(profile_dir)
+    if profiles is None:
+        return
+
+    if backup_dir is None:
+        backup_dir = profile_dir.parent / "_backup"
+
+    machines = sorted(profiles.get(ProfileCategory.MACHINE, []), key=lambda p: p.name)
+    if not machines:
+        console.print("[yellow]No machine profiles found.[/yellow]")
+        return
+
+    from rich.table import Table as RichTable
+    table = RichTable(title="Machine Profiles")
+    table.add_column("#", style="bold cyan", width=4)
+    table.add_column("Machine Name")
+    for idx, m in enumerate(machines, 1):
+        table.add_row(str(idx), m.name)
+    console.print(table)
+    console.print()
+
+    choice = click.prompt("Select printer to remove (number, or 'q' to quit)", type=str, default="q")
+    if choice.lower() == "q":
+        return
+    try:
+        index = int(choice) - 1
+        if not (0 <= index < len(machines)):
+            raise ValueError
+    except ValueError:
+        console.print("[red]Invalid selection.[/red]")
+        return
+
+    target_machine = machines[index]
+    machine_name = target_machine.name
+
+    # Find all filament/process profiles that reference this machine
+    exclusive = []
+    shared = []
+    for category in (ProfileCategory.FILAMENT, ProfileCategory.PROCESS):
+        for profile in profiles.get(category, []):
+            cp = profile.compatible_printers
+            if machine_name in cp:
+                if len(cp) == 1:
+                    exclusive.append(profile)
+                else:
+                    shared.append(profile)
+
+    console.print(f"\n[bold]Removing:[/bold] {machine_name}")
+    console.print(f"  [red]{len(exclusive)}[/red] exclusive profile(s) will be archived (only linked to this printer)")
+    if shared:
+        console.print(f"  [yellow]{len(shared)}[/yellow] shared profile(s) will have this printer removed from compatible_printers")
+    console.print()
+
+    if exclusive:
+        console.print("[bold]Will archive:[/bold]")
+        for p in sorted(exclusive, key=lambda x: (x.category.value, x.name)):
+            console.print(f"  [{p.category.value}] {p.name}")
+        console.print()
+
+    if not click.confirm(f"Proceed? Machine + {len(exclusive)} exclusive profiles archived, {len(shared)} shared profiles updated"):
+        console.print("[yellow]Aborted.[/yellow]")
+        return
+
+    import datetime as _dt
+    timestamp = _dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+    timestamped_backup = backup_dir / timestamp
+    timestamped_backup.mkdir(parents=True, exist_ok=True)
+    console.print(f"[dim]Backing up to: {timestamped_backup}[/dim]")
+
+    from .cleaner import _archive_profile, _backup_json
+    import json
+
+    # Archive the machine profile
+    _archive_profile(target_machine, timestamped_backup)
+    console.print(f"  [yellow]Archived[/yellow] [machine] {machine_name}")
+
+    # Archive exclusive profiles
+    for profile in exclusive:
+        _archive_profile(profile, timestamped_backup)
+        console.print(f"  [yellow]Archived[/yellow] [{profile.category.value}] {profile.name}")
+
+    # Remove machine from shared profiles' compatible_printers
+    for profile in shared:
+        path = profile.json_path
+        if not path.exists():
+            continue
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            _backup_json(profile, timestamped_backup)
+            cp = data.get("compatible_printers", [])
+            data["compatible_printers"] = [p for p in cp if p != machine_name]
+            path.write_text(json.dumps(data, indent=4, ensure_ascii=False) + "\n", encoding="utf-8")
+            console.print(f"  [green]Updated[/green] [{profile.category.value}] {profile.name}")
+        except (json.JSONDecodeError, OSError) as e:
+            console.print(f"  [red]Failed[/red] {profile.name}: {e}")
+
+    total = 1 + len(exclusive) + len(shared)
+    console.print(f"\n[green]Done. {total} profile(s) processed.[/green]")
 
 
 # ---------------------------------------------------------------------------
@@ -404,6 +527,14 @@ def _fix_names(profiles: dict[ProfileCategory, list], backup_dir: Path) -> bool:
         console.print("[green]All profile names are standardized.[/green]\n")
         return False
 
+    machine_renames = [a for a in rename_actions if a.profile.category == ProfileCategory.MACHINE]
+    other_renames = [a for a in rename_actions if a.profile.category != ProfileCategory.MACHINE]
+    if machine_renames and other_renames:
+        console.print(
+            "[yellow]Note:[/yellow] Machine profiles will be renamed first and "
+            "compatible_printers references will be updated automatically.\n"
+        )
+
     console.print(Panel(
         f"[bold]{len(rename_actions)}[/bold] profile(s) have non-standard names",
         title="Name Standardization", border_style="yellow",
@@ -413,7 +544,7 @@ def _fix_names(profiles: dict[ProfileCategory, list], backup_dir: Path) -> bool:
     console.print()
 
     if click.confirm(f"Rename {len(rename_actions)} profile(s)?"):
-        count = execute_renames(console, rename_actions, backup_dir)
+        count = execute_renames(console, rename_actions, backup_dir, all_profiles=profiles)
         console.print(f"[green]{count}/{len(rename_actions)} profile(s) renamed.[/green]\n")
         return True
     else:

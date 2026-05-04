@@ -55,8 +55,10 @@ ocs restore <timestamp>                     # restore from backup
 
 - Filament profiles are hardware-specific: tuned per extruder + hotend combo.
   Same material through different hardware = different profile, NOT a duplicate.
-- Process profiles are printer-specific but filament-agnostic: determined by
-  machine motion capability, not what filament is loaded.
+- Process profiles are printer-model-specific but filament-agnostic: determined by
+  machine motion capability, not what filament is loaded or which extruder/hotend
+  is installed. A process profile applies to ALL hardware variants of a printer model.
+  Naming convention: `<layer>mm - <purpose> (<PrinterModel> - <NozzleSize>)`
 - Machine profiles define the printer with hardware: "PrinterModel - Extruder - Hotend - NozzleSize"
 
 ## Key Paths (macOS)

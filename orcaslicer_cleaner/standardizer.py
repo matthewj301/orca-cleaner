@@ -147,25 +147,35 @@ def find_renames(
     """Scan all profiles and identify those needing name normalization."""
     actions: list[RenameAction] = []
 
-    # Build machine hardware lookup for hardware injection
+    # Build machine hardware lookup for hardware injection (filament profiles)
     machine_hw: dict[str, str] = {}
     for p in profiles.get(ProfileCategory.MACHINE, []):
         hw = _extract_hardware_from_machine(p.name)
         if hw:
             machine_hw[p.name] = hw
 
+    # Build printer model lookups for process profiles
+    machine_models: dict[str, str] = {}  # machine_name -> printer model
+    machines_by_model: dict[str, list[str]] = {}  # model -> [machine_names]
+    for p in profiles.get(ProfileCategory.MACHINE, []):
+        model = _extract_printer_model(p.name)
+        machine_models[p.name] = model
+        machines_by_model.setdefault(model, []).append(p.name)
+
     for category in ProfileCategory:
         for profile in profiles.get(category, []):
             new_name = _normalize_name(profile.name)
 
-            if category in (ProfileCategory.FILAMENT, ProfileCategory.PROCESS):
-                # Hardware injection for nozzle-only parens
+            if category == ProfileCategory.FILAMENT:
                 injected = _inject_hardware(profile, machine_hw)
                 if injected:
                     new_name = _normalize_name(injected)
+                new_name = _normalize_filament_paren(new_name, profile, machine_hw)
 
-                # Normalize parenthetical to match machine hardware format
-                new_name = _normalize_hardware_paren(new_name, profile, machine_hw)
+            elif category == ProfileCategory.PROCESS:
+                new_name = _normalize_process_paren(
+                    new_name, profile, machine_models, machines_by_model
+                )
 
             if new_name != profile.name:
                 actions.append(
@@ -179,12 +189,79 @@ def find_renames(
     return actions
 
 
-def _normalize_hardware_paren(
+def _extract_printer_model(machine_name: str) -> str:
+    """Extract the printer model (first segment) from a machine profile name."""
+    parts = [p.strip() for p in machine_name.split(" - ")]
+    return parts[0]
+
+
+def _extract_nozzle_from_machine(machine_name: str) -> str | None:
+    """Extract the nozzle size from the end of a machine name."""
+    m = re.search(r"(\d+\.?\d*mm)\s*$", machine_name)
+    return m.group(1) if m else None
+
+
+def _normalize_process_paren(
+    name: str,
+    profile: Profile,
+    machine_models: dict[str, str],
+    machines_by_model: dict[str, list[str]],
+) -> str:
+    """Normalize process profile parenthetical to (PrinterModel - NozzleSize).
+
+    Process profiles are determined by printer motion capability, not by
+    extruder/hotend hardware. The parenthetical should identify which printer
+    and nozzle size, not the full hardware path.
+    """
+    m = re.search(r"\(([^)]+)\)\s*$", name)
+    if not m:
+        return name
+
+    paren_content = m.group(1)
+
+    # If it's already just a nozzle size like "(0.6mm)" or "(1mm)", leave it
+    if re.match(r"^\d+\.?\d*mm$", paren_content.strip()):
+        return name
+
+    # Determine the printer model from compatible_printers
+    printer_model = None
+    nozzle = None
+
+    printers = profile.compatible_printers
+    if printers:
+        for cp in printers:
+            model = machine_models.get(cp)
+            if model:
+                printer_model = model
+                nozzle = _extract_nozzle_from_machine(cp)
+                break
+
+    # If no compatible_printers, try to infer from the parenthetical content
+    if not printer_model:
+        # Extract nozzle from parenthetical
+        nozzle_m = re.search(r"(\d+\.?\d*mm)", paren_content)
+        if nozzle_m:
+            nozzle = nozzle_m.group(1)
+        return name  # Can't determine printer model without compatible_printers
+
+    if not nozzle:
+        return name
+
+    # Check if already in the correct format
+    target_paren = f"{printer_model} - {nozzle}"
+    if paren_content == target_paren:
+        return name
+
+    new_name = name[:m.start(1)] + target_paren + name[m.end(1):]
+    return new_name
+
+
+def _normalize_filament_paren(
     name: str,
     profile: Profile,
     machine_hw: dict[str, str],
 ) -> str:
-    """Normalize the hardware parenthetical in a filament/process profile name
+    """Normalize the hardware parenthetical in a filament profile name
     to match the machine's hardware format exactly.
 
     Fixes comma separators -> ' - ' and nozzle size format to match machine.
@@ -195,12 +272,10 @@ def _normalize_hardware_paren(
 
     paren_content = m.group(1)
 
-    # Get the machine hardware string for this profile's printer
     printers = profile.compatible_printers
     if not printers:
         return name
 
-    # Find the matching machine hardware to use as the canonical format
     target_hw = None
     for cp in printers:
         hw = machine_hw.get(cp)
@@ -209,32 +284,25 @@ def _normalize_hardware_paren(
             break
 
     if not target_hw:
-        # No machine with extractable hardware — just normalize separators
         normalized = re.sub(r"\s*,\s*", " - ", paren_content)
         normalized = re.sub(r"\s+", " ", normalized)
         if normalized != paren_content:
             return name[:m.start(1)] + normalized + name[m.end(1):]
         return name
 
-    # The target_hw is the canonical form: "LGX Lite Pro - TeaKettle - 0.4mm"
-    # If the parenthetical content matches the same hardware (same tokens),
-    # replace it with the canonical form
     paren_normalized = re.sub(r"\s*[,]\s*", " - ", paren_content)
     paren_normalized = re.sub(r"(?<=\S)\s+(?=\d+\.?\d*mm)", " - ", paren_normalized)
     paren_normalized = re.sub(r"\s+", " ", paren_normalized).strip()
 
-    # Check if paren tokens match machine hardware tokens (ignoring format)
     paren_tokens = {t.strip().lower() for t in re.split(r"[-,]", paren_normalized) if t.strip()}
     hw_tokens = {t.strip().lower() for t in target_hw.split(" - ") if t.strip()}
 
-    # Normalize nozzle representations for comparison
     nozzle_re = re.compile(r"^\d+\.?\d*mm$")
     paren_nozzles = {t for t in paren_tokens if nozzle_re.match(t)}
     hw_nozzles = {t for t in hw_tokens if nozzle_re.match(t)}
     paren_words = paren_tokens - paren_nozzles
     hw_words = hw_tokens - hw_nozzles
 
-    # If the non-nozzle tokens match, use the machine's canonical form
     if paren_words and paren_words == hw_words:
         new_name = name[:m.start(1)] + target_hw + name[m.end(1):]
         return new_name
@@ -322,6 +390,15 @@ def execute_renames(
     if machine_remap:
         _cascade_machine_renames(console, machine_remap, all_profiles)
 
+    # Build model+nozzle lookup for process profile compatible_printers broadening
+    machines_by_model_nozzle: dict[tuple[str, str], list[str]] = {}
+    if all_profiles:
+        for p in all_profiles.get(ProfileCategory.MACHINE, []):
+            model = _extract_printer_model(p.name)
+            nozzle = _extract_nozzle_from_machine(p.name)
+            if model and nozzle:
+                machines_by_model_nozzle.setdefault((model, nozzle), []).append(p.name)
+
     for action in other_actions:
         try:
             _execute_single_rename(action, timestamped_backup)
@@ -329,12 +406,70 @@ def execute_renames(
                 f"  [green]Renamed[/green] {action.old_name} -> {action.new_name}"
             )
             renamed += 1
+
+            # For process profiles, broaden compatible_printers to all
+            # machines of the same model + nozzle size
+            if action.profile.category == ProfileCategory.PROCESS:
+                _broaden_process_printers(
+                    action, machines_by_model_nozzle, console
+                )
         except Exception as e:
             console.print(
                 f"  [red]Failed[/red] {action.old_name}: {e}"
             )
 
     return renamed
+
+
+def _broaden_process_printers(
+    action: RenameAction,
+    machines_by_model_nozzle: dict[tuple[str, str], list[str]],
+    console: Console,
+) -> None:
+    """After renaming a process profile to (Model - Nozzle), set its
+    compatible_printers to include ALL machines of that model+nozzle."""
+    # Extract model and nozzle from the new name's parenthetical
+    m = re.search(r"\(([^)]+)\)\s*$", action.new_name)
+    if not m:
+        return
+
+    paren = m.group(1)
+    parts = [p.strip() for p in paren.split(" - ")]
+    if len(parts) != 2:
+        return
+
+    model, nozzle = parts[0], parts[1]
+    if not re.match(r"^\d+\.?\d*mm$", nozzle):
+        return
+
+    all_machines = machines_by_model_nozzle.get((model, nozzle), [])
+    if not all_machines:
+        return
+
+    json_path = action.profile.directory / f"{action.new_name}.json"
+    if not json_path.exists():
+        return
+
+    try:
+        data = json.loads(json_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return
+
+    current_cp = set(data.get("compatible_printers", []))
+    target_cp = sorted(all_machines)
+
+    if current_cp != set(target_cp):
+        data["compatible_printers"] = target_cp
+        json_path.write_text(
+            json.dumps(data, indent=4, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+        added = set(target_cp) - current_cp
+        if added:
+            console.print(
+                f"    [cyan]Broadened compatible_printers to {len(target_cp)} "
+                f"machine(s) for {model}[/cyan]"
+            )
 
 
 def _cascade_machine_renames(

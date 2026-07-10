@@ -143,14 +143,25 @@ def plan_cleanup(
                     )
 
     if "dupes" in types:
-        from .deduplicator import recommend_keep
+        from .deduplicator import _is_variation_of, recommend_keep
 
         for group in dupe_groups:
             if group.match_type != "exact_content":
                 continue
+            # Machines are referenced by name from other profiles — never
+            # auto-archive them.
+            if any(p.category == ProfileCategory.MACHINE for p in group.profiles):
+                continue
             keep = recommend_keep(group)
             for profile in group.profiles:
                 if profile is not keep:
+                    # Only auto-archive name VARIATIONS (beta/copy/v2) of the
+                    # keeper. Identical content under structurally different
+                    # names (e.g. different hardware in the name) may be the
+                    # only copy serving another printer — those need the
+                    # interactive review in `fix --only dupes`.
+                    if not _is_variation_of(profile.name, keep.name):
+                        continue
                     key = _key(profile)
                     if key not in seen:
                         seen.add(key)

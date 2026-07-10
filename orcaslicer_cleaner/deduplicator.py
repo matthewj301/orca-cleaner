@@ -184,8 +184,12 @@ def find_duplicates(
         if len(category_profiles) < 2:
             continue
 
-        # Pass 1: exact content duplicates (by hash) -- always valid
-        groups.extend(_find_exact_dupes(category_profiles))
+        # Pass 1: exact content duplicates (by hash). NEVER for machines:
+        # machine profiles for different hardware routinely differ only in
+        # their name, and each is a real printer that other profiles
+        # reference by that name.
+        if category != ProfileCategory.MACHINE:
+            groups.extend(_find_exact_dupes(category_profiles))
 
         # Pass 2: variation-based name matching (domain-aware)
         groups.extend(_find_variation_dupes(category_profiles, category))

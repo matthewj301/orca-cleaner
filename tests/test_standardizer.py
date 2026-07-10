@@ -65,6 +65,11 @@ class TestNozzleMinimalForm:
         "0.20mm - Production",           # leading layer height stays padded
         "0.40mm - K3 - Whistles",        # 0.40 layer height is valid, not a nozzle
         "Doomcube - LGX Lite Pro - TeaKettle - 0.4mm",  # already minimal
+        # Regression (2026-07-10 data loss incident): mid-name mm values are
+        # layer heights in non-convention names — never strip them.
+        "Voron0.2 - 0.20mm - CF - Functional",
+        "Voron0.2 - 0.20mm - Speed",
+        "Nozzle 0.2 - 0.10mm - silk",
     ])
     def test_does_not_touch_layer_heights_or_minimal_nozzles(self, input_name):
         assert _normalize_name(input_name) == input_name

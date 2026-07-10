@@ -141,6 +141,38 @@ class TestArchive:
         assert manifest["filament/PLA - Shared_1.json"] == str(target.json_path)
 
 
+class TestCleanDupesGuards:
+    """Regression (2026-07-10 data loss): `clean --type dupes` must never
+    auto-archive machines or identical-content profiles whose names are NOT
+    variations of each other (cross-hardware twins may be the only copy
+    serving another printer)."""
+
+    def test_cross_named_twins_not_auto_archived(self, profile_tree, console, tmp_path):
+        from orcaslicer_cleaner.cleaner import plan_cleanup
+        from orcaslicer_cleaner.deduplicator import find_duplicates
+
+        root = profile_tree / "1234567890"
+        settings = {"temperature": ["255"], "compatible_printers": [MACHINE_A]}
+        write_profile(root, "filament", "ABS - Fillamentum (WWBMG - TeaKettle - 0.4mm)", settings)
+        write_profile(root, "filament", "ABS - Fillamentum (LGX Lite Pro - TeaKettle - 0.4mm)", settings)
+        write_profile(root, "filament", "ABS - Fillamentum (LGX Lite Pro - TeaKettle - 0.4mm) - beta", settings)
+        profiles = load_tree(profile_tree)
+
+        actions = plan_cleanup([], find_duplicates(profiles), types=("dupes",))
+        names = {a.profile.name for a in actions}
+        # The beta variation is archivable; the cross-hardware twin is NOT.
+        assert "ABS - Fillamentum (LGX Lite Pro - TeaKettle - 0.4mm) - beta" in names
+        assert "ABS - Fillamentum (WWBMG - TeaKettle - 0.4mm)" not in names
+
+    def test_machine_dupes_never_planned(self, profile_tree):
+        from orcaslicer_cleaner.cleaner import plan_cleanup
+        from orcaslicer_cleaner.deduplicator import find_duplicates
+
+        profiles = load_tree(profile_tree)
+        actions = plan_cleanup([], find_duplicates(profiles), types=("dupes",))
+        assert not any(a.profile.category == ProfileCategory.MACHINE for a in actions)
+
+
 # ---------------------------------------------------------------------------
 # Remap
 # ---------------------------------------------------------------------------

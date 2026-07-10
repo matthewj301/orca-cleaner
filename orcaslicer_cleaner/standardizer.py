@@ -72,15 +72,18 @@ def _normalize_name(name: str) -> str:
     result = _expand_abbreviations(result)
 
     # Rule 4: Nozzle sizes drop trailing zeros: "0.40mm" -> "0.4mm".
-    # Applies to mm values anywhere EXCEPT the start of the name — leading
-    # values are layer heights, which Rule 1 pads the other way ("0.20mm").
+    # ONLY in nozzle positions — the very end of the name or the end of a
+    # trailing parenthetical. Mid-name mm values can be layer heights in
+    # non-convention names ("Voron0.2 - 0.20mm - Speed") and must not be
+    # touched; leading values are layer heights padded the other way by
+    # Rule 1.
     def _minimal_nozzle(m: re.Match) -> str:
         if m.start() == 0:
             return m.group(0)
         num = m.group(1).rstrip("0").rstrip(".")
-        return f"{num}mm"
+        return f"{num}mm{m.group(2)}"
 
-    result = re.sub(r"(\d+\.\d*0)mm\b", _minimal_nozzle, result)
+    result = re.sub(r"(\d+\.\d*0)mm(\s*\)?\s*)$", _minimal_nozzle, result)
 
     # Rule 5: Collapse multiple spaces
     result = re.sub(r"  +", " ", result)

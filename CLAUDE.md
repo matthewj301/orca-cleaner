@@ -107,11 +107,18 @@ Global flags `--profile-dir` / `--system-profiles` override the default paths;
   Same material through different hardware = different profile, NOT a duplicate.
 - Duplicate classification: the content hash EXCLUDES the "name" field (it
   mirrors the filename) and compatible_printers. Identical content + identical
-  printers = "exact_content" (auto-archivable via `clean --type dupes`);
-  identical content + different printers = "mergeable" (resolved in
-  `fix --only dupes` by keeping one profile with the union of printers).
-  Machine-category duplicates are never auto-resolved — other profiles
-  reference machine names, so they go through `remove-printer`.
+  printers = "exact_content"; identical content + different printers =
+  "mergeable" (resolved in `fix --only dupes` by keeping one profile with the
+  union of printers).
+- DATA-LOSS GUARDS (from the 2026-07-10 incident — do not weaken):
+  `clean --type dupes` auto-archives ONLY name-variations (beta/copy/v2) of
+  the keeper. Identical content under structurally different names (e.g.
+  different hardware in the name) may be the only copy serving another
+  printer — interactive review only. Machines NEVER participate in
+  exact-content dedup (they routinely differ only by name, and other profiles
+  reference them by name). The nozzle minimal-form rename rule applies only
+  at the very END of a name or trailing parenthetical — mid-name mm values
+  are layer heights in non-convention names.
 - Process profiles are printer-model-specific but filament-agnostic: determined by
   machine motion capability, not what filament is loaded or which extruder/hotend
   is installed. A process profile applies to ALL hardware variants of a printer model.

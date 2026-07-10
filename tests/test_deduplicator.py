@@ -95,6 +95,23 @@ class TestRecommendKeep:
         )
         assert recommend_keep(group) is newer
 
+    def test_machines_never_form_exact_content_groups(self):
+        """Regression (2026-07-10 data loss): two machines whose settings
+        differ only by name are different printers, not duplicates."""
+        a = make_profile(
+            "Doomcube - LGX Lite Pro - TeaKettle - 0.4mm",
+            {"inherits": "Base", "retraction_length": ["0.5"]},
+            category=ProfileCategory.MACHINE,
+        )
+        b = make_profile(
+            "Doomcube - WWBMG - TeaKettle - 0.4mm",
+            {"inherits": "Base", "retraction_length": ["0.5"]},
+            category=ProfileCategory.MACHINE,
+        )
+        groups = find_duplicates({ProfileCategory.MACHINE: [a, b]})
+        assert not find(groups, "exact_content")
+        assert not find(groups, "mergeable")
+
     def test_variant_group_still_prefers_recency(self):
         """Beta/test variants differ in content — latest tune wins even if
         its name is non-standard."""

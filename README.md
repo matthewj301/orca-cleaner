@@ -77,7 +77,7 @@ This matters for duplicate detection. Two filament profiles with the same materi
 The tool expects (and can standardize toward) this naming pattern:
 
 - Filament: `Material - Brand (Extruder - Hotend - NozzleSize)`
-- Process: `LayerHeight - Purpose (Extruder - Hotend - NozzleSize)`
+- Process: `LayerHeight - Purpose (PrinterModel - NozzleSize)`
 - Machine: `PrinterModel - Extruder - Hotend - NozzleSize`
 
 Your naming doesn't have to match exactly — the tool does its best with whatever it finds.

@@ -105,6 +105,42 @@ def _expand_abbreviations(name: str) -> str:
 # Match a nozzle-only parenthetical at the end of a name
 _NOZZLE_ONLY_PAREN_RE = re.compile(r"\((\d+\.?\d*mm)\)\s*$")
 
+# Any trailing parenthetical at all (hardware, material descriptor, ...)
+_ANY_TRAILING_PAREN_RE = re.compile(r"\([^)]*\)\s*$")
+
+
+def _append_hardware(
+    name: str,
+    profile: Profile,
+    machine_hw: dict[str, str],
+) -> str | None:
+    """If a filament profile has NO trailing parenthetical and its
+    compatible_printers resolve to exactly one hardware path, return `name`
+    with "(Extruder - Hotend - NozzleSize)" appended. Otherwise None.
+
+    Names that already end in any parenthetical are left alone — the
+    contents may be a material descriptor ("(Satin PLA)") or a hardware
+    nickname, and both need human judgment, not automation.
+    """
+    if _ANY_TRAILING_PAREN_RE.search(name):
+        return None
+
+    printers = profile.compatible_printers
+    if not printers:
+        return None
+
+    hw_paths: set[str] = set()
+    for cp in printers:
+        hw = machine_hw.get(cp)
+        if hw is None:
+            return None  # a linked machine has no hardware segment (e.g. "Model - 0.4mm")
+        hw_paths.add(hw)
+
+    if len(hw_paths) != 1:
+        return None  # ambiguous across differently-equipped machines
+
+    return f"{name.rstrip()} ({hw_paths.pop()})"
+
 
 def _extract_hardware_from_machine(machine_name: str) -> str | None:
     """Extract the hardware path from a machine profile name.
@@ -184,6 +220,10 @@ def find_renames(
                 injected = _inject_hardware(profile, machine_hw)
                 if injected:
                     new_name = _normalize_name(injected)
+                else:
+                    appended = _append_hardware(new_name, profile, machine_hw)
+                    if appended:
+                        new_name = appended
                 new_name = _normalize_filament_paren(new_name, profile, machine_hw)
 
             elif category == ProfileCategory.PROCESS:

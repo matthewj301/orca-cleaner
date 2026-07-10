@@ -180,3 +180,58 @@ class TestProcessParenNormalization:
             p.name, p, machine_models, machines_by_model
         )
         assert result == "0.20mm - Standard (Unknown HW - 0.5mm)"
+
+
+class TestAppendHardware:
+    """Filaments linked to printers but missing the (Extruder - Hotend -
+    NozzleSize) parenthetical get it appended from their machine."""
+
+    MACHINE_HW = {
+        "Bambu Lab X1 Carbon - Pika - 0.4mm": "Pika - 0.4mm",
+        "Doomcube - WWBMG - TeaKettle - 0.4mm": "WWBMG - TeaKettle - 0.4mm",
+        "Doomcube - LGX Lite Pro - TeaKettle - 0.4mm": "LGX Lite Pro - TeaKettle - 0.4mm",
+    }
+
+    def _filament(self, name, printers):
+        from orcaslicer_cleaner.standardizer import _append_hardware
+        p = Profile(
+            name=name, category=ProfileCategory.FILAMENT, directory=Path("/tmp"),
+            settings={"compatible_printers": printers},
+        )
+        return _append_hardware(name, p, self.MACHINE_HW)
+
+    def test_appends_hardware_from_single_machine(self):
+        result = self._filament("PolyTerra PLA - Black", ["Bambu Lab X1 Carbon - Pika - 0.4mm"])
+        assert result == "PolyTerra PLA - Black (Pika - 0.4mm)"
+
+    def test_same_hw_across_machines_ok(self):
+        # different machines, identical hardware path -> unambiguous
+        hw = dict(self.MACHINE_HW)
+        hw["Voron - WWBMG - TeaKettle - 0.4mm"] = "WWBMG - TeaKettle - 0.4mm"
+        from orcaslicer_cleaner.standardizer import _append_hardware
+        p = Profile(
+            name="ASA - 3DO", category=ProfileCategory.FILAMENT, directory=Path("/tmp"),
+            settings={"compatible_printers": [
+                "Doomcube - WWBMG - TeaKettle - 0.4mm", "Voron - WWBMG - TeaKettle - 0.4mm",
+            ]},
+        )
+        assert _append_hardware("ASA - 3DO", p, hw) == "ASA - 3DO (WWBMG - TeaKettle - 0.4mm)"
+
+    def test_ambiguous_hardware_skipped(self):
+        result = self._filament("ASA - 3DO", [
+            "Doomcube - WWBMG - TeaKettle - 0.4mm",
+            "Doomcube - LGX Lite Pro - TeaKettle - 0.4mm",
+        ])
+        assert result is None
+
+    def test_existing_parenthetical_skipped(self):
+        assert self._filament(
+            "PolyMaker - PolyTerra PLA+ (Satin PLA)", ["Bambu Lab X1 Carbon - Pika - 0.4mm"]
+        ) is None
+
+    def test_empty_cp_skipped(self):
+        assert self._filament("PolyTerra PLA - Black", []) is None
+
+    def test_machine_without_hw_segment_skipped(self):
+        # e.g. "Snapmaker U1 - 0.4mm" resolves to no hardware path
+        assert self._filament("HTPLA - Protopasta", ["Snapmaker U1 - 0.4mm"]) is None

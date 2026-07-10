@@ -199,3 +199,23 @@ class TestRemovePrinterAlwaysHardConfirms:
         assert not (root / "machine" / f"{MACHINE_A}.json").exists()
         assert not (root / "filament" / "ASA - Only A.json").exists()
         assert "Blast Radius Warning" in result.output
+
+
+class TestRenameNotReportedAsLoss:
+    def test_fix_names_rename_reports_no_coverage_lost(self, tmp_path):
+        """Regression: a successful rename changes the profile's name, which
+        the coverage snapshot keys on — it must NOT show up as a loss."""
+        machine = "Doomcube - WWBMG - TeaKettle - 0.4mm"
+        user_dir = tmp_path / "user"
+        root = user_dir / "1234567890"
+        write_profile(root, "machine", machine, {"name": machine})
+        write_profile(
+            root, "process", "0.2mm - Draft (Doomcube - 0.4mm)",
+            {"compatible_printers": [machine]},
+        )
+
+        result = run_cli(user_dir, ["fix", "--only", "names"], input="y\n")
+        assert result.exit_code == 0, result.output
+        assert "Renamed" in result.output
+        assert "no coverage lost" in result.output
+        assert "lost 1 profile" not in result.output

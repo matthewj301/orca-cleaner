@@ -546,6 +546,98 @@ def audit_links(
     return issues
 
 
+@dataclass
+class UnassignedProfile:
+    """A profile with empty compatible_printers and no hardware hint in its
+    name — audit_links can't tell what printer(s) it belongs to, so it needs
+    interactive assignment."""
+
+    profile: Profile
+    suggested_printers: list[str]  # best-effort, may be empty
+
+
+def _machine_model(machine_name: str) -> str:
+    """First ' - '-delimited segment of a machine name (the printer model)."""
+    return machine_name.split(" - ")[0].strip()
+
+
+# System-preset shorthand that appears in `inherits` values but not in
+# machine model names (e.g. "0.12mm Fine @BBL X1C" should suggest the
+# "Bambu Lab X1 Carbon" machines).
+_MODEL_ALIASES = {
+    "bbl": "bambu lab",
+    "x1c": "x1 carbon",
+    "p1s": "p1s",
+    "u1": "snapmaker u1",
+}
+
+
+def _model_tokens_match(text: str, machine_names: list[str]) -> list[str]:
+    """Find machine models whose model segment case-insensitively matches
+    (substring, either direction) a token in `text`. Returns matching machine
+    NAMES (not models), one entry per matching machine. Tokens are also
+    expanded through _MODEL_ALIASES so system-preset shorthand like
+    "@BBL X1C" matches "Bambu Lab X1 Carbon"."""
+    text_lower = text.lower()
+    raw_tokens = [t for t in re.split(r"[\s@,()/-]+", text_lower) if len(t) >= 2]
+    tokens = [t for t in raw_tokens if len(t) >= 3]
+    tokens += [_MODEL_ALIASES[t] for t in raw_tokens if t in _MODEL_ALIASES]
+    if not tokens:
+        return []
+
+    matched: list[str] = []
+    for machine in machine_names:
+        model_lower = _machine_model(machine).lower()
+        for token in tokens:
+            if token in model_lower or model_lower in token:
+                matched.append(machine)
+                break
+    return matched
+
+
+def find_unassigned(
+    profiles: dict[ProfileCategory, list[Profile]],
+) -> list[UnassignedProfile]:
+    """Find filament/process profiles with empty compatible_printers AND no
+    hardware hint in their name (i.e. audit_links would not already report
+    them under the "empty" issue — they're silently invisible-to-none/all
+    with no signal to act on).
+
+    Suggestions (best-effort, priority order):
+      (a) tokens of the profile's `inherits` value matched against machine
+          model names (first " - " segment), case-insensitive substring
+          either direction.
+      (b) tokens of the profile NAME matched the same way.
+    For process profiles, when a model matches, ALL machines of that model
+    are suggested (process profiles are model-scoped, not hardware-scoped).
+    """
+    machine_names = {p.name for p in profiles.get(ProfileCategory.MACHINE, [])}
+    machine_list = sorted(machine_names)
+    unassigned: list[UnassignedProfile] = []
+
+    for category in (ProfileCategory.FILAMENT, ProfileCategory.PROCESS):
+        for profile in profiles.get(category, []):
+            if profile.compatible_printers:
+                continue
+            if _extract_hardware_hint(profile, machine_names) is not None:
+                continue
+
+            suggestions: list[str] = []
+            if profile.inherits:
+                suggestions = _model_tokens_match(profile.inherits, machine_list)
+            if not suggestions:
+                suggestions = _model_tokens_match(profile.name, machine_list)
+
+            unassigned.append(
+                UnassignedProfile(
+                    profile=profile,
+                    suggested_printers=sorted(set(suggestions)),
+                )
+            )
+
+    return unassigned
+
+
 def execute_link_fixes(
     console: Console,
     fixes: list[tuple[Profile, list[str]]],

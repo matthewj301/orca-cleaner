@@ -86,7 +86,9 @@ ocs remove-printer "Machine Name"           # DESTRUCTIVE: delete a machine + it
                                             #   filament/process profiles; strips it from shared ones (interactive)
 ocs fix                                     # interactive: remap refs, fix links, resolve dupes, standardize names
 ocs fix --only remap                        # remap/remove broken compatible_printers printer names
-ocs fix --only links                        # fix empty/mismatched compatible_printers
+ocs fix --only links                        # fix empty/mismatched compatible_printers, then
+                                            #   interactively assign hint-less empty-cp profiles
+                                            #   (suggestions from each profile's inherits value)
 ocs fix --only dupes                        # resolve duplicate groups: pick keeper, archive rest,
                                             #   merge compatible_printers for "mergeable" groups
 ocs fix --only names                        # standardize names (machines first, cascade automatic)
@@ -98,6 +100,8 @@ ocs undo                                    # restore the most recent backup (un
 ocs restore                                 # list available backups (shows which operation made each)
 ocs restore 20260425_1104                   # restore a backup (timestamp prefix match ok)
 ocs restore <ts> --profile "Name"           # restore a single profile from a backup
+ocs prune-backups --keep 20                 # preview deletion of old timestamped backups
+                                            #   (--execute + typed "yes"; curated dirs never touched)
 ```
 
 Global flags `--profile-dir` / `--system-profiles` override the default paths;
@@ -132,6 +136,14 @@ Global flags `--profile-dir` / `--system-profiles` override the default paths;
   is installed. A process profile applies to ALL hardware variants of a printer model.
   Naming convention: `<layer>mm - <purpose> (<PrinterModel> - <NozzleSize>)`
 - Machine profiles define the printer with hardware: "PrinterModel - Extruder - Hotend - NozzleSize"
+
+## Off-disk backup
+
+`~/git/orcaslicer-profiles-backup` git-snapshots the live `user/` dir via
+`snapshot.sh` (rsync + commit-if-changed + push). Scheduled weekly by the
+launchd agent `com.mjohnson.orcaslicer-backup` (plist staged in that repo's
+`launchd/`). This protects against failures the tool's own `_backup/` can't
+(disk loss, OrcaSlicer bugs, deletion outside the tool).
 
 ## Key Paths (macOS)
 

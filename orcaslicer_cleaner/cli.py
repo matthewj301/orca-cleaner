@@ -15,6 +15,7 @@ from rich.text import Text
 
 from . import loader, reporter
 from .cleaner import (
+    CleanAction,
     DupeResolution,
     RemapAction,
     audit_links,
@@ -26,6 +27,7 @@ from .cleaner import (
     filter_actions_by_printer,
     find_broken_references,
     find_printer_dependents,
+    find_unassigned,
     plan_cleanup,
     preview_actions,
 )
@@ -346,7 +348,7 @@ def remove_printer(ctx: click.Context, backup_dir: Path | None) -> None:
     if exclusive:
         console.print("[bold]Will archive:[/bold]")
         for p in sorted(exclusive, key=lambda x: (x.category.value, x.name)):
-            console.print(f"  [{p.category.value}] {p.name}")
+            console.print(f"  \\[{p.category.value}] {p.name}")
         console.print()
 
     to_archive = [target_machine] + exclusive
@@ -508,7 +510,28 @@ def _fix_remap(profiles: dict[ProfileCategory, list], backup_dir: Path, profile_
 
 
 def _fix_links(profiles: dict[ProfileCategory, list], backup_dir: Path, profile_dir: Path) -> bool:
-    """Fix empty/mismatched compatible_printers. Returns True if any work was done."""
+    """Fix empty/mismatched compatible_printers, then interactively assign
+    printers to profiles with empty compatible_printers and no hardware hint
+    in their name. Returns True if either phase did work."""
+    did_something = _fix_links_known(profiles, backup_dir, profile_dir)
+
+    # Reload so the unassigned-profile phase doesn't act on stale data if
+    # the known-issue phase above just mutated files.
+    if did_something:
+        reloaded = _load(profile_dir)
+        if reloaded is not None:
+            profiles = reloaded
+
+    if _fix_links_unassigned(profiles, backup_dir, profile_dir):
+        did_something = True
+
+    return did_something
+
+
+def _fix_links_known(profiles: dict[ProfileCategory, list], backup_dir: Path, profile_dir: Path) -> bool:
+    """Fix empty/mismatched compatible_printers where a hardware hint in the
+    profile name lets audit_links determine the fix automatically. Returns
+    True if any work was done."""
     link_issues = audit_links(profiles)
     fixable = [i for i in link_issues if i.issue != "orphaned"]
 
@@ -563,6 +586,123 @@ def _fix_links(profiles: dict[ProfileCategory, list], backup_dir: Path, profile_
     if _confirm_with_blast_radius(assessment, f"Update compatible_printers for {len(fixes)} profile(s)?"):
         count = execute_link_fixes(console, fixes, backup_dir)
         console.print(f"[green]{count}/{len(fixes)} profile(s) updated.[/green]\n")
+        _post_mutation_report(profile_dir, profiles, snapshot)
+        return True
+    else:
+        console.print("[yellow]Skipped.[/yellow]\n")
+        return False
+
+
+# Above this count, unassigned profiles are grouped by category (process
+# first) and a count is printed, so a big backlog doesn't scroll off-screen
+# before the user gets any orientation.
+_UNASSIGNED_GROUP_THRESHOLD = 15
+
+
+def _fix_links_unassigned(profiles: dict[ProfileCategory, list], backup_dir: Path, profile_dir: Path) -> bool:
+    """Interactively assign printers to profiles with empty compatible_printers
+    and no hardware hint in their name (audit_links can't fix these on its
+    own). Returns True if any work was done."""
+    unassigned = find_unassigned(profiles)
+    if not unassigned:
+        console.print("[green]No unassigned profiles to review.[/green]\n")
+        return False
+
+    machines = sorted(profiles.get(ProfileCategory.MACHINE, []), key=lambda p: p.name)
+    if not machines:
+        console.print("[yellow]No machine profiles found to assign to.[/yellow]\n")
+        return False
+    machine_names = [m.name for m in machines]
+
+    console.print(Panel(
+        f"[bold]{len(unassigned)}[/bold] profile(s) have empty compatible_printers "
+        "and no hardware hint in their name — these are invisible to the usual "
+        "link audit and need manual assignment.",
+        title="Unassigned Profiles", border_style="yellow",
+    ))
+
+    if len(unassigned) > _UNASSIGNED_GROUP_THRESHOLD:
+        console.print(
+            f"[dim]{len(unassigned)} profiles to review — grouped by category "
+            "(process first), one at a time.[/dim]\n"
+        )
+        order = {ProfileCategory.PROCESS: 0, ProfileCategory.FILAMENT: 1, ProfileCategory.MACHINE: 2}
+        unassigned = sorted(unassigned, key=lambda u: (order.get(u.profile.category, 9), u.profile.name))
+
+    assignments: list[tuple[Profile, list[str]]] = []
+    archives: list[Profile] = []
+    stopped_early = False
+
+    for idx, item in enumerate(unassigned, 1):
+        profile = item.profile
+        console.print(
+            f"\n[bold]{idx}/{len(unassigned)}[/bold] "
+            f"\\[{profile.category.value}] {profile.name}"
+        )
+        if profile.inherits:
+            console.print(f"  [dim]inherits: {profile.inherits}[/dim]")
+
+        suggested = set(item.suggested_printers)
+        table = Table(show_header=False, box=None, padding=(0, 1))
+        table.add_column("Key", style="bold cyan", width=4)
+        table.add_column("Machine Profile")
+        table.add_column("")
+        for midx, name in enumerate(machine_names):
+            tag = "[green]suggested[/green]" if name in suggested else ""
+            table.add_row(f"{midx + 1})", name, tag)
+        table.add_row("a)", "[yellow]Archive (belongs to no current printer)[/yellow]", "")
+        table.add_row("s)", "[dim]Skip[/dim]", "")
+        table.add_row("q)", "[dim]Stop processing[/dim]", "")
+        console.print(table)
+
+        choice = click.prompt("  Choice", type=str, default="s").strip().lower()
+
+        if choice == "q":
+            stopped_early = True
+            break
+        if choice == "s":
+            continue
+        if choice == "a":
+            archives.append(profile)
+            console.print(f"  [yellow]Will archive[/yellow] '{profile.name}'")
+            continue
+
+        try:
+            indices = [int(tok.strip()) - 1 for tok in choice.split(",") if tok.strip()]
+            if not indices or any(not (0 <= i < len(machine_names)) for i in indices):
+                raise ValueError
+        except ValueError:
+            console.print("  [red]Invalid choice, skipping.[/red]")
+            continue
+
+        chosen = [machine_names[i] for i in indices]
+        assignments.append((profile, chosen))
+        console.print(f"  [green]Will assign -> {', '.join(chosen)}[/green]")
+
+    if not assignments and not archives:
+        console.print()
+        return False
+
+    console.print()
+    summary = (
+        f"{len(assignments)} profile(s) assigned, {len(archives)} profile(s) archived"
+    )
+    if stopped_early:
+        summary += " (stopped early — remaining profiles skipped)"
+
+    to_modify = [p for p, _ in assignments]
+    assessment = assess_blast_radius(profiles, to_archive=archives, to_modify=to_modify)
+    snapshot = coverage_snapshot(profiles)
+    if _confirm_with_blast_radius(assessment, f"Apply changes? {summary}"):
+        updated = execute_link_fixes(console, assignments, backup_dir) if assignments else 0
+        archived = 0
+        if archives:
+            actions = [CleanAction(action="archive", profile=p, reason="No current printer match") for p in archives]
+            archived = execute_actions(console, actions, backup_dir)
+        console.print(
+            f"[green]{updated}/{len(assignments)} assigned, "
+            f"{archived}/{len(archives)} archived.[/green]\n"
+        )
         _post_mutation_report(profile_dir, profiles, snapshot)
         return True
     else:
@@ -752,6 +892,20 @@ def _fix_names(profiles: dict[ProfileCategory, list], backup_dir: Path, profile_
     if _confirm_with_blast_radius(assessment, f"Rename {len(rename_actions)} profile(s)?"):
         count = execute_renames(console, rename_actions, backup_dir, all_profiles=profiles)
         console.print(f"[green]{count}/{len(rename_actions)} profile(s) renamed.[/green]\n")
+        # Coverage is tracked by profile name, so an applied rename would
+        # read as a "loss" in the post-op diff. Translate the before-snapshot
+        # to post-rename names (only for renames that actually landed).
+        for action in rename_actions:
+            new_json = action.profile.directory / f"{action.new_name}.json"
+            old_json = action.profile.directory / f"{action.old_name}.json"
+            if not new_json.exists() or old_json.exists():
+                continue
+            old_key = f"{action.profile.category.value}:{action.old_name}"
+            new_key = f"{action.profile.category.value}:{action.new_name}"
+            for entries in snapshot.values():
+                if old_key in entries:
+                    entries.discard(old_key)
+                    entries.add(new_key)
         _post_mutation_report(profile_dir, profiles, snapshot)
         return True
     else:
@@ -1105,6 +1259,86 @@ def matrix(ctx: click.Context, category: str | None) -> None:
         console.print()
     if category is None or category.lower() == "process":
         matrix_mod.print_process_matrix(console, profiles)
+
+
+# ---------------------------------------------------------------------------
+# prune-backups — delete old timestamped backup directories
+# ---------------------------------------------------------------------------
+
+
+_BACKUP_TS_RE = re.compile(r"^\d{8}_\d{6}(_\d+)?$")
+
+
+@cli.command("prune-backups")
+@click.option("--keep", type=int, default=20, help="Number of newest backups to keep.", show_default=True)
+@click.option("--execute", is_flag=True, help="Apply pruning. Without this flag, only previews.")
+@click.pass_context
+def prune_backups(ctx: click.Context, keep: int, execute: bool) -> None:
+    """Delete old timestamped backup directories, keeping the newest N.
+
+    Only directories matching the timestamped backup naming pattern
+    (YYYYMMDD_HHMMSS[_N]) are ever considered — manually curated or
+    otherwise-named directories under _backup/ are never touched.
+    """
+    profile_dir: Path = ctx.obj["profile_dir"]
+    backup_root = profile_dir.parent / "_backup"
+
+    if not backup_root.is_dir():
+        stderr_console.print(f"[yellow]No backup directory found at {backup_root}[/yellow]")
+        return
+
+    all_dirs = [d for d in backup_root.iterdir() if d.is_dir()]
+    timestamped = sorted(
+        (d for d in all_dirs if _BACKUP_TS_RE.match(d.name)),
+        key=lambda d: d.name,
+        reverse=True,
+    )
+
+    if len(timestamped) <= keep:
+        console.print(
+            f"[green]Nothing to prune.[/green] {len(timestamped)} timestamped backup(s) "
+            f"found, keep threshold is {keep}."
+        )
+        return
+
+    kept = timestamped[:keep]
+    candidates = timestamped[keep:]
+
+    table = Table(title="Backup Prune Candidates")
+    table.add_column("Timestamp", width=20)
+    table.add_column("Operation", width=18)
+    table.add_column("Files", justify="right", width=8)
+    for bdir in candidates:
+        files = [f for f in bdir.rglob("*.*") if f.name != MANIFEST_NAME]
+        table.add_row(bdir.name, load_operation(bdir) or "--", str(len(files)))
+    console.print(table)
+
+    console.print(
+        f"\n[bold]{len(candidates)}[/bold] backup dir(s) would be deleted, "
+        f"[bold]{len(kept)}[/bold] kept."
+    )
+    console.print("[dim]Non-timestamped dirs (manually curated) are never touched.[/dim]")
+
+    if not execute:
+        console.print("\n[dim]Run with --execute to apply.[/dim]")
+        return
+
+    response = click.prompt(
+        "Type 'yes' to permanently delete these backup dirs", default="no"
+    )
+    if response.strip().lower() != "yes":
+        console.print("[yellow]Aborted.[/yellow]")
+        return
+
+    deleted = 0
+    for bdir in candidates:
+        try:
+            shutil.rmtree(bdir)
+            console.print(f"  [red]Deleted[/red] {bdir.name}")
+            deleted += 1
+        except Exception as e:
+            console.print(f"  [red]Failed[/red] {bdir.name}: {e}")
+    console.print(f"\n[green]Done. {deleted}/{len(candidates)} backup dir(s) deleted.[/green]")
 
 
 # ---------------------------------------------------------------------------

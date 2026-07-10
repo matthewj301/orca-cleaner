@@ -377,7 +377,7 @@ def execute_renames(
 
     Returns the number of profiles successfully renamed.
     """
-    timestamped_backup = create_backup_dir(backup_dir)
+    timestamped_backup = create_backup_dir(backup_dir, "fix-names")
     console.print(f"[dim]Backing up to: {timestamped_backup}[/dim]")
 
     actions = _preflight_renames(console, actions)

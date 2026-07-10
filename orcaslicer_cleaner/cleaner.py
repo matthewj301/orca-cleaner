@@ -235,7 +235,7 @@ def execute_actions(
     Adds a timestamp subdirectory to prevent overwriting previous backups.
     Returns the number of actions successfully executed.
     """
-    timestamped_backup = create_backup_dir(backup_dir)
+    timestamped_backup = create_backup_dir(backup_dir, "clean")
     console.print(f"[dim]Backing up to: {timestamped_backup}[/dim]")
 
     executed = 0
@@ -304,7 +304,7 @@ def execute_remap(
 
     Returns the number of profiles successfully modified.
     """
-    timestamped_backup = create_backup_dir(backup_dir)
+    timestamped_backup = create_backup_dir(backup_dir, "fix-remap")
     console.print(f"[dim]Backing up to: {timestamped_backup}[/dim]")
 
     # Collect all modifications per profile (a profile may appear in multiple actions)
@@ -555,7 +555,7 @@ def execute_link_fixes(
 
     Returns number of profiles updated.
     """
-    timestamped_backup = create_backup_dir(backup_dir)
+    timestamped_backup = create_backup_dir(backup_dir, "fix-links")
     console.print(f"[dim]Backing up to: {timestamped_backup}[/dim]")
 
     updated = 0
@@ -643,7 +643,7 @@ def execute_dupe_resolutions(
 
     Returns the number of groups successfully resolved.
     """
-    timestamped_backup = create_backup_dir(backup_dir)
+    timestamped_backup = create_backup_dir(backup_dir, "fix-dupes")
     console.print(f"[dim]Backing up to: {timestamped_backup}[/dim]")
 
     resolved = 0
@@ -700,7 +700,7 @@ def execute_printer_removal(
 
     Returns the number of profiles processed.
     """
-    timestamped_backup = create_backup_dir(backup_dir)
+    timestamped_backup = create_backup_dir(backup_dir, "remove-printer")
     console.print(f"[dim]Backing up to: {timestamped_backup}[/dim]")
 
     processed = 0

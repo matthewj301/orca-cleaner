@@ -14,6 +14,7 @@ import datetime
 import json
 import os
 import shutil
+import sys
 import tempfile
 from pathlib import Path
 
@@ -36,11 +37,13 @@ def atomic_write_json(path: Path, data: dict) -> None:
         raise
 
 
-def create_backup_dir(backup_root: Path) -> Path:
+def create_backup_dir(backup_root: Path, operation: str | None = None) -> Path:
     """Create and return a fresh timestamped backup directory under backup_root.
 
     Two operations in the same second get distinct directories so their
-    backups (and manifests) never merge.
+    backups (and manifests) never merge. `operation` records provenance in
+    the manifest (which command created this backup, with argv and time) so
+    forensics never has to infer it from file patterns.
     """
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     backup_dir = backup_root / timestamp
@@ -49,7 +52,22 @@ def create_backup_dir(backup_root: Path) -> Path:
         backup_dir = backup_root / f"{timestamp}_{counter}"
         counter += 1
     backup_dir.mkdir(parents=True)
+    if operation:
+        atomic_write_json(backup_dir / MANIFEST_NAME, {
+            "operation": {
+                "command": operation,
+                "argv": sys.argv[1:],
+                "time": datetime.datetime.now().isoformat(timespec="seconds"),
+            },
+            "files": {},
+        })
     return backup_dir
+
+
+def load_operation(backup_dir: Path) -> str | None:
+    """Return the operation label recorded in a backup's manifest, if any."""
+    op = _load_manifest_data(backup_dir).get("operation", {})
+    return op.get("command") if isinstance(op, dict) else None
 
 
 def _load_manifest_data(backup_dir: Path) -> dict:

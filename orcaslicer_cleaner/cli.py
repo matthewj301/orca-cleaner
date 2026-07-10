@@ -29,9 +29,17 @@ from .cleaner import (
     plan_cleanup,
     preview_actions,
 )
-from .fileops import MANIFEST_NAME, backup_copy, create_backup_dir, load_manifest, load_renames
+from .fileops import (
+    MANIFEST_NAME,
+    backup_copy,
+    create_backup_dir,
+    load_manifest,
+    load_operation,
+    load_renames,
+)
 from .deduplicator import find_duplicates, recommend_keep
 from .models import Profile, ProfileCategory
+from .safety import assess_blast_radius, coverage_lost, coverage_snapshot, new_broken_refs
 from .standardizer import execute_renames, find_renames, preview_renames
 from .system_profiles import load_system_profile_names
 from .validators import validate_all
@@ -41,6 +49,37 @@ DEFAULT_SYSTEM_PROFILES = Path("/Applications/OrcaSlicer.app/Contents/Resources/
 
 console = Console()
 stderr_console = Console(stderr=True)
+
+
+def _confirm_with_blast_radius(assessment, prompt_text: str) -> bool:
+    """Confirm an operation, escalating to a typed 'yes' when the blast
+    radius assessment carries warnings (e.g. coverage-affecting archives)."""
+    if not assessment.warnings:
+        return click.confirm(prompt_text)
+
+    for warning in assessment.warnings:
+        console.print(Panel(warning, title="Blast Radius Warning", border_style="red"))
+
+    response = click.prompt("Type 'yes' to proceed", default="no")
+    return response.strip().lower() == "yes"
+
+
+def _post_mutation_report(profile_dir: Path, before_profiles, before_snapshot) -> None:
+    """Reload profiles after a mutation and report any coverage lost or new
+    broken references, so silent damage doesn't go unnoticed."""
+    after_profiles = _load(profile_dir)
+    if after_profiles is None:
+        console.print("[yellow]Warning: could not reload profiles for post-operation check.[/yellow]")
+        return
+
+    lines = coverage_lost(before_snapshot, coverage_snapshot(after_profiles))
+    lines += new_broken_refs(before_profiles, after_profiles)
+
+    if lines:
+        body = "\n".join(lines) + "\n\n[dim]Undo with: ocs undo[/dim]"
+        console.print(Panel(body, title="Post-operation check", border_style="red"))
+    else:
+        console.print("[dim]Post-operation check: no coverage lost, no new broken references.[/dim]")
 
 
 @click.group()
@@ -234,12 +273,20 @@ def clean(
 
     preview_actions(console, actions)
     console.print()
-    if not click.confirm(f"Execute {len(actions)} action(s)? Files will be backed up to {backup_dir}"):
+
+    to_archive = [a.profile for a in actions]
+    assessment = assess_blast_radius(profiles, to_archive)
+    snapshot = coverage_snapshot(profiles)
+
+    if not _confirm_with_blast_radius(
+        assessment, f"Execute {len(actions)} action(s)? Files will be backed up to {backup_dir}"
+    ):
         console.print("[yellow]Aborted.[/yellow]")
         return
 
     count = execute_actions(console, actions, backup_dir)
     console.print(f"\n[green]Done. {count}/{len(actions)} actions completed.[/green]")
+    _post_mutation_report(profile_dir, profiles, snapshot)
 
 
 # ---------------------------------------------------------------------------
@@ -302,12 +349,20 @@ def remove_printer(ctx: click.Context, backup_dir: Path | None) -> None:
             console.print(f"  [{p.category.value}] {p.name}")
         console.print()
 
-    if not click.confirm(f"Proceed? Machine + {len(exclusive)} exclusive profiles archived, {len(shared)} shared profiles updated"):
+    to_archive = [target_machine] + exclusive
+    assessment = assess_blast_radius(profiles, to_archive, to_modify=shared)
+    snapshot = coverage_snapshot(profiles)
+
+    if not _confirm_with_blast_radius(
+        assessment,
+        f"Proceed? Machine + {len(exclusive)} exclusive profiles archived, {len(shared)} shared profiles updated",
+    ):
         console.print("[yellow]Aborted.[/yellow]")
         return
 
     total = execute_printer_removal(console, target_machine, exclusive, shared, backup_dir)
     console.print(f"\n[green]Done. {total} profile(s) processed.[/green]")
+    _post_mutation_report(profile_dir, profiles, snapshot)
 
 
 # ---------------------------------------------------------------------------
@@ -354,31 +409,31 @@ def fix(ctx: click.Context, backup_dir: Path | None, fix_types: tuple[str, ...])
 
     # --- Phase 1: Broken reference remap ---
     if run_all or "remap" in fix_types:
-        if _fix_remap(profiles, backup_dir):
+        if _fix_remap(profiles, backup_dir, profile_dir):
             did_something = True
             _reload()
 
     # --- Phase 2: Link audit (empty/mismatched compatible_printers) ---
     if run_all or "links" in fix_types:
-        if _fix_links(profiles, backup_dir):
+        if _fix_links(profiles, backup_dir, profile_dir):
             did_something = True
             _reload()
 
     # --- Phase 3: Duplicate resolution ---
     if run_all or "dupes" in fix_types:
-        if _fix_dupes(profiles, backup_dir):
+        if _fix_dupes(profiles, backup_dir, profile_dir):
             did_something = True
             _reload()
 
     # --- Phase 4: Name standardization ---
     if run_all or "names" in fix_types:
-        did_something |= _fix_names(profiles, backup_dir)
+        did_something |= _fix_names(profiles, backup_dir, profile_dir)
 
     if not did_something:
         console.print("\n[green]Nothing to fix — all clean![/green]")
 
 
-def _fix_remap(profiles: dict[ProfileCategory, list], backup_dir: Path) -> bool:
+def _fix_remap(profiles: dict[ProfileCategory, list], backup_dir: Path, profile_dir: Path) -> bool:
     """Interactive broken reference remap. Returns True if any work was done."""
     broken = find_broken_references(profiles)
     if not broken:
@@ -437,16 +492,22 @@ def _fix_remap(profiles: dict[ProfileCategory, list], backup_dir: Path) -> bool:
 
     console.print()
     total_affected = sum(len(a.affected_profiles) for a in actions)
-    if click.confirm(f"Apply {len(actions)} remap action(s) affecting {total_affected} profile(s)?"):
+    to_modify = [p for a in actions for p in a.affected_profiles]
+    assessment = assess_blast_radius(profiles, [], to_modify=to_modify)
+    snapshot = coverage_snapshot(profiles)
+    if _confirm_with_blast_radius(
+        assessment, f"Apply {len(actions)} remap action(s) affecting {total_affected} profile(s)?"
+    ):
         modified = execute_remap(console, actions, backup_dir)
         console.print(f"[green]{modified} profile(s) updated.[/green]\n")
+        _post_mutation_report(profile_dir, profiles, snapshot)
         return True
     else:
         console.print("[yellow]Skipped.[/yellow]\n")
         return False
 
 
-def _fix_links(profiles: dict[ProfileCategory, list], backup_dir: Path) -> bool:
+def _fix_links(profiles: dict[ProfileCategory, list], backup_dir: Path, profile_dir: Path) -> bool:
     """Fix empty/mismatched compatible_printers. Returns True if any work was done."""
     link_issues = audit_links(profiles)
     fixable = [i for i in link_issues if i.issue != "orphaned"]
@@ -496,9 +557,13 @@ def _fix_links(profiles: dict[ProfileCategory, list], backup_dir: Path) -> bool:
 
     fixes = [(issue.profile, issue.suggested_printers) for issue in fixable]
 
-    if click.confirm(f"Update compatible_printers for {len(fixes)} profile(s)?"):
+    to_modify = [issue.profile for issue in fixable]
+    assessment = assess_blast_radius(profiles, [], to_modify=to_modify)
+    snapshot = coverage_snapshot(profiles)
+    if _confirm_with_blast_radius(assessment, f"Update compatible_printers for {len(fixes)} profile(s)?"):
         count = execute_link_fixes(console, fixes, backup_dir)
         console.print(f"[green]{count}/{len(fixes)} profile(s) updated.[/green]\n")
+        _post_mutation_report(profile_dir, profiles, snapshot)
         return True
     else:
         console.print("[yellow]Skipped.[/yellow]\n")
@@ -525,7 +590,7 @@ def _fmt_printers(printers: list[str], max_len: int = 60) -> str:
     return joined
 
 
-def _fix_dupes(profiles: dict[ProfileCategory, list], backup_dir: Path) -> bool:
+def _fix_dupes(profiles: dict[ProfileCategory, list], backup_dir: Path, profile_dir: Path) -> bool:
     """Interactively resolve duplicate/near-duplicate groups. Returns True if
     any work was done."""
     groups = find_duplicates(profiles)
@@ -643,16 +708,21 @@ def _fix_dupes(profiles: dict[ProfileCategory, list], backup_dir: Path) -> bool:
     if stopped_early:
         summary += " (stopped early — remaining groups skipped)"
 
-    if click.confirm(f"Apply resolutions? {summary}"):
+    to_archive = [p for r in resolutions for p in r.archive]
+    to_modify = [r.keep for r in resolutions if r.merged_printers]
+    assessment = assess_blast_radius(profiles, to_archive, to_modify=to_modify)
+    snapshot = coverage_snapshot(profiles)
+    if _confirm_with_blast_radius(assessment, f"Apply resolutions? {summary}"):
         count = execute_dupe_resolutions(console, resolutions, backup_dir)
         console.print(f"[green]{count}/{len(resolutions)} group(s) resolved.[/green]\n")
+        _post_mutation_report(profile_dir, profiles, snapshot)
         return True
     else:
         console.print("[yellow]Skipped.[/yellow]\n")
         return False
 
 
-def _fix_names(profiles: dict[ProfileCategory, list], backup_dir: Path) -> bool:
+def _fix_names(profiles: dict[ProfileCategory, list], backup_dir: Path, profile_dir: Path) -> bool:
     """Fix naming inconsistencies. Returns True if any work was done."""
     rename_actions = find_renames(profiles)
 
@@ -676,9 +746,13 @@ def _fix_names(profiles: dict[ProfileCategory, list], backup_dir: Path) -> bool:
     preview_renames(console, rename_actions)
     console.print()
 
-    if click.confirm(f"Rename {len(rename_actions)} profile(s)?"):
+    to_modify = [a.profile for a in rename_actions]
+    assessment = assess_blast_radius(profiles, [], to_modify=to_modify)
+    snapshot = coverage_snapshot(profiles)
+    if _confirm_with_blast_radius(assessment, f"Rename {len(rename_actions)} profile(s)?"):
         count = execute_renames(console, rename_actions, backup_dir, all_profiles=profiles)
         console.print(f"[green]{count}/{len(rename_actions)} profile(s) renamed.[/green]\n")
+        _post_mutation_report(profile_dir, profiles, snapshot)
         return True
     else:
         console.print("[yellow]Skipped.[/yellow]\n")
@@ -798,12 +872,18 @@ def restore(ctx: click.Context, timestamp: str | None, profile_name: str | None,
     if timestamp is None:
         table = Table(title="Available Backups")
         table.add_column("Timestamp", width=20)
+        table.add_column("Operation", width=18)
         table.add_column("Files", justify="right", width=8)
         table.add_column("Categories", max_width=40)
         for bdir in backup_dirs:
             files = [f for f in bdir.rglob("*.*") if f.name != MANIFEST_NAME]
             cats = sorted({f.parent.name for f in files if f.parent != bdir})
-            table.add_row(bdir.name, str(len(files)), ", ".join(cats) if cats else "--")
+            table.add_row(
+                bdir.name,
+                load_operation(bdir) or "--",
+                str(len(files)),
+                ", ".join(cats) if cats else "--",
+            )
         console.print(table)
         console.print("\n[dim]Use 'ocs restore <timestamp>' to restore a backup.[/dim]")
         return
@@ -941,7 +1021,7 @@ def restore(ctx: click.Context, timestamp: str | None, profile_name: str | None,
     # Back up anything we're about to overwrite or remove so the restore
     # is itself undoable
     if conflicts or removals:
-        overwrite_backup = create_backup_dir(backup_root)
+        overwrite_backup = create_backup_dir(backup_root, "restore-overwrites")
         console.print(f"[dim]Backing up overwritten files to: {overwrite_backup}[/dim]")
         for _, dst in restore_files:
             if dst.exists():
@@ -960,6 +1040,37 @@ def restore(ctx: click.Context, timestamp: str | None, profile_name: str | None,
         except Exception as e:
             console.print(f"  [red]Failed[/red] {src.name}: {e}")
     console.print(f"\n[green]Done. {restored}/{len(restore_files)} file(s) restored.[/green]")
+
+
+# ---------------------------------------------------------------------------
+# undo — restore the most recent backup
+# ---------------------------------------------------------------------------
+
+
+@cli.command()
+@click.option("--force", is_flag=True, help="Skip confirmation prompt.")
+@click.pass_context
+def undo(ctx: click.Context, force: bool) -> None:
+    """Undo the last operation by restoring the most recent backup."""
+    profile_dir: Path = ctx.obj["profile_dir"]
+    backup_root = profile_dir.parent / "_backup"
+
+    if not backup_root.is_dir():
+        stderr_console.print(f"[yellow]No backup directory found at {backup_root}[/yellow]")
+        return
+    candidates = sorted(
+        [d for d in backup_root.iterdir() if d.is_dir() and re.match(r"^\d{8}_\d{6}", d.name)],
+        key=lambda d: d.name,
+        reverse=True,
+    )
+    if not candidates:
+        stderr_console.print("[yellow]No backups found.[/yellow]")
+        return
+
+    latest = candidates[0]
+    operation = load_operation(latest) or "unknown operation"
+    console.print(f"Most recent backup: [bold]{latest.name}[/bold] ({operation})")
+    ctx.invoke(restore, timestamp=latest.name, profile_name=None, force=force)
 
 
 # ---------------------------------------------------------------------------

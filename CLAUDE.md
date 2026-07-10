@@ -37,7 +37,7 @@ CLI tool to validate, deduplicate, and clean up OrcaSlicer user profiles.
 
 ```
 orcaslicer_cleaner/
-  cli.py          - Click CLI entry point (commands: scan, clean, remove-printer, fix, diff, matrix, restore)
+  cli.py          - Click CLI entry point (commands: scan, clean, remove-printer, fix, diff, matrix, restore, undo)
   models.py       - Data models (Profile, ProfileInfo, ValidationIssue, DuplicateGroup)
   loader.py       - Discovers and parses .info/.json profile pairs from disk
   validators.py   - Validation checks (orphans, broken refs w/ near-match suggestion, stale, malformed JSON)
@@ -46,7 +46,8 @@ orcaslicer_cleaner/
   reporter.py     - Rich tables/panels for terminal output + JSON export
   cleaner.py      - Backup/archive/delete/link-audit/printer-removal operations with dry-run support
   standardizer.py - Name normalization (layer heights, hyphens, abbreviations, HW injection, machine rename cascade, process model-naming)
-  fileops.py      - Atomic JSON writes, timestamped backup dirs, backup manifests
+  fileops.py      - Atomic JSON writes, timestamped backup dirs, backup manifests w/ operation provenance
+  safety.py       - Blast-radius assessment + coverage snapshot/diff for guarding mutations
   system_profiles.py - Read-only system profile name loader from OrcaSlicer app bundle
 tests/
   test_standardizer.py, test_machine_matching.py, test_mutations.py - run with `pytest`
@@ -93,7 +94,8 @@ ocs matrix                                  # read-only coverage matrix (filamen
 ocs matrix --category filament              # material/brand x machine matrix only
 ocs diff "Profile A" "Profile B"            # compare two profiles; fuzzy "did you mean?" on miss
 ocs diff --category process A B             # disambiguate names that exist in multiple categories
-ocs restore                                 # list available backups
+ocs undo                                    # restore the most recent backup (undo last operation)
+ocs restore                                 # list available backups (shows which operation made each)
 ocs restore 20260425_1104                   # restore a backup (timestamp prefix match ok)
 ocs restore <ts> --profile "Name"           # restore a single profile from a backup
 ```
@@ -110,6 +112,12 @@ Global flags `--profile-dir` / `--system-profiles` override the default paths;
   printers = "exact_content"; identical content + different printers =
   "mergeable" (resolved in `fix --only dupes` by keeping one profile with the
   union of printers).
+- Safety rails (do not weaken): every mutation batch is pre-flighted by
+  `safety.assess_blast_radius` — plans that touch a machine, archive >=3 AND
+  >15% of a category, or archive >=20 profiles require a typed "yes" instead
+  of y/n. After every mutation the CLI reloads and reports coverage lost per
+  printer + newly broken references, with an `ocs undo` hint. Backup manifests
+  record which command created them (fileops.create_backup_dir operation arg).
 - DATA-LOSS GUARDS (from the 2026-07-10 incident — do not weaken):
   `clean --type dupes` auto-archives ONLY name-variations (beta/copy/v2) of
   the keeper. Identical content under structurally different names (e.g.

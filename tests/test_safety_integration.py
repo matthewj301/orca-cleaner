@@ -219,3 +219,48 @@ class TestRenameNotReportedAsLoss:
         assert "Renamed" in result.output
         assert "no coverage lost" in result.output
         assert "lost 1 profile" not in result.output
+
+
+class TestOrcaSlicerRunningGuard:
+    """Regression (2026-07-10 incident #2): OrcaSlicer's sync engine deletes
+    profiles modified externally while it runs. Mutating commands must refuse
+    to touch the REAL profile dir while the app is open."""
+
+    def _tree(self, tmp_path):
+        machine = "Doomcube - WWBMG - TeaKettle - 0.4mm"
+        user_dir = tmp_path / "user"
+        root = user_dir / "1234567890"
+        write_profile(root, "machine", machine, {"name": machine})
+        write_profile(root, "process", "0.2mm - Draft (Doomcube - 0.4mm)",
+                      {"compatible_printers": [machine]})
+        return user_dir
+
+    def test_fix_refuses_when_app_running_on_default_dir(self, tmp_path, monkeypatch):
+        from orcaslicer_cleaner import cli as cli_mod
+        user_dir = self._tree(tmp_path)
+        monkeypatch.setattr(cli_mod, "DEFAULT_PROFILE_DIR", user_dir)
+        monkeypatch.setattr(cli_mod, "_orcaslicer_running", lambda: True)
+
+        result = run_cli(user_dir, ["fix", "--only", "names"], input="y\n")
+        assert "OrcaSlicer is running" in result.output
+        # the rename did NOT happen
+        assert (user_dir / "1234567890" / "process" / "0.2mm - Draft (Doomcube - 0.4mm).json").exists()
+
+    def test_non_default_dir_not_blocked(self, tmp_path, monkeypatch):
+        from orcaslicer_cleaner import cli as cli_mod
+        user_dir = self._tree(tmp_path)
+        # DEFAULT_PROFILE_DIR points elsewhere -> sandbox dirs unaffected
+        monkeypatch.setattr(cli_mod, "_orcaslicer_running", lambda: True)
+
+        result = run_cli(user_dir, ["fix", "--only", "names"], input="y\n")
+        assert "OrcaSlicer is running" not in result.output
+        assert "Renamed" in result.output
+
+    def test_scan_never_blocked(self, tmp_path, monkeypatch):
+        from orcaslicer_cleaner import cli as cli_mod
+        user_dir = self._tree(tmp_path)
+        monkeypatch.setattr(cli_mod, "DEFAULT_PROFILE_DIR", user_dir)
+        monkeypatch.setattr(cli_mod, "_orcaslicer_running", lambda: True)
+
+        result = run_cli(user_dir, ["scan"])
+        assert "OrcaSlicer is running" not in result.output

@@ -6,6 +6,13 @@ CLI tool to validate, deduplicate, and clean up OrcaSlicer user profiles.
 
 - The user's live profiles at `~/Library/Application Support/OrcaSlicer/user/` are
   irreplaceable tuned calibration data — never modify them without explicit consent.
+- NEVER mutate profiles while OrcaSlicer is running. The app's sync engine
+  treats externally-modified profiles as conflicts and DELETES them (writes
+  `sync_info = delete` to the .info and removes the .json) — this silently
+  destroyed 20 profiles and several machines on 2026-07-10. Mutating commands
+  refuse to run against the default profile dir while the app is open
+  (`_ensure_app_closed` in cli.py); recovery from such deletions = restore the
+  .json AND rewrite `sync_info = delete` -> `update`, with the app closed.
 - Every mutation backs up to `_backup/` (timestamped dir) BEFORE writing and is
   gated: `clean` requires `--execute`; `fix` and `remove-printer` prompt
   interactively. `ocs restore` is the undo. Archive, never hard-delete.

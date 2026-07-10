@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 import shutil
+import subprocess
 import sys
 from pathlib import Path
 
@@ -64,6 +65,35 @@ def _confirm_with_blast_radius(assessment, prompt_text: str) -> bool:
 
     response = click.prompt("Type 'yes' to proceed", default="no")
     return response.strip().lower() == "yes"
+
+
+def _orcaslicer_running() -> bool:
+    try:
+        result = subprocess.run(
+            ["pgrep", "-f", "OrcaSlicer.app/Contents/MacOS/OrcaSlicer"],
+            capture_output=True,
+        )
+        return result.returncode == 0
+    except OSError:
+        return False
+
+
+def _ensure_app_closed(profile_dir: Path) -> bool:
+    """Refuse to mutate the real profile library while OrcaSlicer is running.
+
+    The app's sync engine treats externally-modified profiles as conflicts
+    and DELETES them (marks sync_info=delete and removes the .json) — the
+    2026-07-10 incident lost 20 profiles this way. Only enforced for the
+    default profile dir; test/sandbox dirs are not at risk.
+    """
+    if profile_dir != DEFAULT_PROFILE_DIR or not _orcaslicer_running():
+        return True
+    stderr_console.print(
+        "[red]OrcaSlicer is running — quit it before modifying profiles.[/red]\n"
+        "Its sync engine deletes profiles that change on disk underneath it "
+        "(sync_info=delete). Close the app fully (Cmd-Q) and re-run."
+    )
+    return False
 
 
 def _post_mutation_report(profile_dir: Path, before_profiles, before_snapshot) -> None:
@@ -270,6 +300,9 @@ def clean(
         console.print("[green]Nothing to clean.[/green]")
         return
 
+    if not _ensure_app_closed(profile_dir):
+        return
+
     if backup_dir is None:
         backup_dir = profile_dir.parent / "_backup"
 
@@ -302,6 +335,8 @@ def clean(
 def remove_printer(ctx: click.Context, backup_dir: Path | None) -> None:
     """Remove a printer and archive all filament/process profiles exclusively linked to it."""
     profile_dir: Path = ctx.obj["profile_dir"]
+    if not _ensure_app_closed(profile_dir):
+        return
     profiles = _load(profile_dir)
     if profiles is None:
         return
@@ -386,6 +421,8 @@ def fix(ctx: click.Context, backup_dir: Path | None, fix_types: tuple[str, ...])
     Walks through each fixable issue category and lets you review and apply.
     """
     profile_dir: Path = ctx.obj["profile_dir"]
+    if not _ensure_app_closed(profile_dir):
+        return
     profiles = _load(profile_dir)
     if profiles is None:
         return
@@ -1012,6 +1049,8 @@ def diff_cmd(ctx: click.Context, profile_a: str, profile_b: str, category: str |
 def restore(ctx: click.Context, timestamp: str | None, profile_name: str | None, force: bool) -> None:
     """Restore profiles from a backup."""
     profile_dir: Path = ctx.obj["profile_dir"]
+    if timestamp is not None and not _ensure_app_closed(profile_dir):
+        return
     backup_root = profile_dir.parent / "_backup"
 
     if not backup_root.is_dir():

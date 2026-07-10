@@ -10,6 +10,27 @@ from itertools import combinations
 from rapidfuzz import fuzz
 
 from .models import DuplicateGroup, Profile, ProfileCategory
+from .standardizer import _normalize_name
+
+
+def recommend_keep(group: DuplicateGroup) -> Profile:
+    """Pick which profile in a duplicate group to keep.
+
+    For identical-content groups (exact_content/mergeable) recency is
+    meaningless — the settings are the same bytes and updated_time is only
+    cloud-sync time — so prefer the profile whose name already follows the
+    naming conventions, with recency as the tie-break. For variant groups
+    (beta/test iterations) content differs, so most-recently-updated wins.
+    """
+    if group.match_type in ("exact_content", "mergeable"):
+        return max(
+            group.profiles,
+            key=lambda p: (
+                _normalize_name(p.name) == p.name,
+                p.info.updated_time if p.info else 0,
+            ),
+        )
+    return group.recommended_keep
 
 # Thresholds
 CONTENT_SIMILARITY_THRESHOLD = 0.95
@@ -178,9 +199,21 @@ def find_duplicates(
 # ---------------------------------------------------------------------------
 
 
+# Fields that scope a profile to printers rather than describing its tuning.
+_COMPAT_FIELDS = ("compatible_printers", "compatible_printers_condition")
+
+
 def _content_hash(profile: Profile) -> str | None:
-    """SHA-256 of normalized settings for exact-match comparison."""
-    stripped = profile.settings_without_metadata()
+    """SHA-256 of normalized settings, excluding printer-compatibility fields.
+
+    Compatibility is compared separately: identical tuning with identical
+    compatible_printers is an exact duplicate; identical tuning scoped to
+    different printers is "mergeable" (one profile could serve both).
+    """
+    stripped = {
+        k: v for k, v in profile.settings_without_metadata().items()
+        if k not in _COMPAT_FIELDS
+    }
     if not stripped:
         return None
     canonical = json.dumps(stripped, sort_keys=True, separators=(",", ":"))
@@ -188,7 +221,13 @@ def _content_hash(profile: Profile) -> str | None:
 
 
 def _find_exact_dupes(profiles: list[Profile]) -> list[DuplicateGroup]:
-    """Find profiles with identical settings (ignoring metadata)."""
+    """Find profiles with identical settings (ignoring metadata).
+
+    Groups whose members also share the same compatible_printers are
+    "exact_content" (safe to auto-archive); groups whose members differ only
+    in compatible_printers are "mergeable" (one profile with the union of
+    printers can replace them — needs a merge, not an archive).
+    """
     hash_to_profiles: dict[str, list[Profile]] = {}
 
     for p in profiles:
@@ -199,13 +238,28 @@ def _find_exact_dupes(profiles: list[Profile]) -> list[DuplicateGroup]:
 
     groups: list[DuplicateGroup] = []
     for h, ps in hash_to_profiles.items():
-        if len(ps) > 1:
+        if len(ps) < 2:
+            continue
+        compat_sets = {tuple(sorted(p.compatible_printers)) for p in ps}
+        if len(compat_sets) == 1:
             groups.append(
                 DuplicateGroup(
                     profiles=ps,
                     similarity_score=1.0,
                     match_type="exact_content",
                     details=f"Identical settings (hash: {h[:12]}...)",
+                )
+            )
+        else:
+            groups.append(
+                DuplicateGroup(
+                    profiles=ps,
+                    similarity_score=1.0,
+                    match_type="mergeable",
+                    details=(
+                        f"Identical settings, different printers "
+                        f"(hash: {h[:12]}...) — can merge into one profile"
+                    ),
                 )
             )
 
@@ -423,7 +477,7 @@ def _merge_groups(groups: list[DuplicateGroup]) -> list[DuplicateGroup]:
         # Keep highest similarity and best match type
         if g.similarity_score > existing.similarity_score:
             existing.similarity_score = g.similarity_score
-        type_priority = {"exact_content": 3, "content_similar": 2, "name_similar": 1}
+        type_priority = {"exact_content": 4, "mergeable": 3, "content_similar": 2, "name_similar": 1}
         if type_priority.get(g.match_type, 0) > type_priority.get(existing.match_type, 0):
             existing.match_type = g.match_type
             existing.details = g.details

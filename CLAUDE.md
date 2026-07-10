@@ -9,6 +9,13 @@ CLI tool to validate, deduplicate, and clean up OrcaSlicer user profiles.
 - Every mutation backs up to `_backup/` (timestamped dir) BEFORE writing and is
   gated: `clean` requires `--execute`; `fix` and `remove-printer` prompt
   interactively. `ocs restore` is the undo. Archive, never hard-delete.
+- All backup/write plumbing goes through `fileops.py`: atomic JSON writes
+  (temp file + os.replace), collision-free timestamped backup dirs, and a
+  per-backup `manifest.json` mapping each backed-up file to its original
+  absolute path. `restore` uses the manifest to return files to their original
+  user root and original name (even collision-suffixed copies), falls back to
+  the first user root for pre-manifest backups, and backs up anything it
+  overwrites into a new timestamped dir.
 - Rename machine profiles BEFORE filament/process profiles. `compatible_printers`
   references machine names by exact string, so an uncascaded machine rename breaks
   every dependent profile. The standardizer enforces machine-first ordering and
@@ -18,25 +25,31 @@ CLI tool to validate, deduplicate, and clean up OrcaSlicer user profiles.
   it is also the most common pre-existing link issue `scan` finds.
 - Broken `compatible_printers` references are ERROR severity: they make filaments
   invisible for that printer (functional breakage, not cosmetic).
-- Mutation code lives in `cleaner.py` and `standardizer.py` (renames + cascades),
-  plus the legacy `remove-printer` handler in `cli.py`. Put new mutations in
-  `cleaner.py` or `standardizer.py`, always backup-then-write.
+- Mutation code lives in `cleaner.py` (including printer removal) and
+  `standardizer.py` (renames + cascades); `cli.py` only gathers input and
+  confirms. Put new mutations in `cleaner.py` or `standardizer.py`, always
+  backup-then-write via the `fileops.py` helpers.
+- Renames are pre-flighted: actions whose target name already exists on disk
+  or collides with another action in the batch are skipped, so a rename can
+  never leave a split profile (`New.info` + `Old.json`).
 
 ## Project Structure
 
 ```
 orcaslicer_cleaner/
-  cli.py          - Click CLI entry point (commands: scan, clean, remove-printer, fix, diff, restore)
+  cli.py          - Click CLI entry point (commands: scan, clean, remove-printer, fix, diff, matrix, restore)
   models.py       - Data models (Profile, ProfileInfo, ValidationIssue, DuplicateGroup)
   loader.py       - Discovers and parses .info/.json profile pairs from disk
   validators.py   - Validation checks (orphans, broken refs w/ near-match suggestion, stale, malformed JSON)
   deduplicator.py - Fuzzy name matching (rapidfuzz) + content hash dedup
+  matrix.py       - Read-only material x printer / process x model coverage matrices
   reporter.py     - Rich tables/panels for terminal output + JSON export
-  cleaner.py      - Backup/archive/delete/link-audit operations with dry-run support
+  cleaner.py      - Backup/archive/delete/link-audit/printer-removal operations with dry-run support
   standardizer.py - Name normalization (layer heights, hyphens, abbreviations, HW injection, machine rename cascade, process model-naming)
+  fileops.py      - Atomic JSON writes, timestamped backup dirs, backup manifests
   system_profiles.py - Read-only system profile name loader from OrcaSlicer app bundle
 tests/
-  test_standardizer.py, test_machine_matching.py - run with `pytest`
+  test_standardizer.py, test_machine_matching.py, test_mutations.py - run with `pytest`
 ```
 
 ## OrcaSlicer Profile Format
@@ -70,10 +83,14 @@ ocs clean --type stale --execute            # archive one category
 ocs clean --printer Doomcube                # limit to one printer (--exclude-printer skips one)
 ocs remove-printer "Machine Name"           # DESTRUCTIVE: delete a machine + its exclusively-linked
                                             #   filament/process profiles; strips it from shared ones (interactive)
-ocs fix                                     # interactive: remap refs, fix links, standardize names
+ocs fix                                     # interactive: remap refs, fix links, resolve dupes, standardize names
 ocs fix --only remap                        # remap/remove broken compatible_printers printer names
 ocs fix --only links                        # fix empty/mismatched compatible_printers
+ocs fix --only dupes                        # resolve duplicate groups: pick keeper, archive rest,
+                                            #   merge compatible_printers for "mergeable" groups
 ocs fix --only names                        # standardize names (machines first, cascade automatic)
+ocs matrix                                  # read-only coverage matrix (filament + process)
+ocs matrix --category filament              # material/brand x machine matrix only
 ocs diff "Profile A" "Profile B"            # compare two profiles; fuzzy "did you mean?" on miss
 ocs diff --category process A B             # disambiguate names that exist in multiple categories
 ocs restore                                 # list available backups
@@ -88,6 +105,13 @@ Global flags `--profile-dir` / `--system-profiles` override the default paths;
 
 - Filament profiles are hardware-specific: tuned per extruder + hotend combo.
   Same material through different hardware = different profile, NOT a duplicate.
+- Duplicate classification: the content hash EXCLUDES the "name" field (it
+  mirrors the filename) and compatible_printers. Identical content + identical
+  printers = "exact_content" (auto-archivable via `clean --type dupes`);
+  identical content + different printers = "mergeable" (resolved in
+  `fix --only dupes` by keeping one profile with the union of printers).
+  Machine-category duplicates are never auto-resolved — other profiles
+  reference machine names, so they go through `remove-printer`.
 - Process profiles are printer-model-specific but filament-agnostic: determined by
   machine motion capability, not what filament is loaded or which extruder/hotend
   is installed. A process profile applies to ALL hardware variants of a printer model.
@@ -115,9 +139,14 @@ Global flags `--profile-dir` / `--system-profiles` override the default paths;
 - The `standardizer.py` hyphen rule only touches hyphens with existing whitespace
   on at least one side, preserving compound words like "V-Core" and "ASA-CF"
 - Nozzle sizes in machine names (`0.4mm`) must match exactly what filament
-  profiles reference. The layer-height padding rule only applies to values at
-  the START of a name (process profiles); nozzle sizes at the end are never
-  padded. `ocs scan` flags mismatches as ERROR with a "did you mean?" suggestion.
+  profiles reference. Two mirror-image rules: layer heights at the START of a
+  name are padded to two decimals (`0.2mm` -> `0.20mm`); nozzle sizes anywhere
+  ELSE drop trailing zeros (`0.40mm` -> `0.4mm`). `ocs scan` flags mismatches
+  as ERROR with a "did you mean?" suggestion.
+- Duplicate keeper recommendation: for exact_content/mergeable groups the
+  convention-following name wins (recency tie-break) — updated_time is only
+  sync time and identical bytes make it meaningless; for beta/test variant
+  groups most-recently-updated wins (latest tune).
 - Process profiles are broadened to ALL machine variants of a given model+nozzle
   when renamed. E.g., renaming to `(Doomcube - 0.4mm)` sets compatible_printers
   to both `Doomcube - LGX Lite Pro - TeaKettle - 0.4mm` and `Doomcube - WWBMG - TeaKettle - 0.4mm`.

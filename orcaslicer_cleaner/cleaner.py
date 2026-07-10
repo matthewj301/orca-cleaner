@@ -2,9 +2,7 @@
 
 from __future__ import annotations
 
-import datetime
 import json
-import shutil
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -12,6 +10,7 @@ from rich.console import Console
 
 import re
 
+from .fileops import atomic_write_json, backup_copy, backup_move, create_backup_dir
 from .models import DuplicateGroup, IssueType, Profile, ProfileCategory, ValidationIssue
 
 # ---------------------------------------------------------------------------
@@ -144,10 +143,12 @@ def plan_cleanup(
                     )
 
     if "dupes" in types:
+        from .deduplicator import recommend_keep
+
         for group in dupe_groups:
             if group.match_type != "exact_content":
                 continue
-            keep = group.recommended_keep
+            keep = recommend_keep(group)
             for profile in group.profiles:
                 if profile is not keep:
                     key = _key(profile)
@@ -223,9 +224,7 @@ def execute_actions(
     Adds a timestamp subdirectory to prevent overwriting previous backups.
     Returns the number of actions successfully executed.
     """
-    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    timestamped_backup = backup_dir / timestamp
-    timestamped_backup.mkdir(parents=True, exist_ok=True)
+    timestamped_backup = create_backup_dir(backup_dir)
     console.print(f"[dim]Backing up to: {timestamped_backup}[/dim]")
 
     executed = 0
@@ -246,20 +245,8 @@ def execute_actions(
 
 def _archive_profile(profile: Profile, backup_dir: Path) -> None:
     """Move a profile's files to the backup directory."""
-    category_backup = backup_dir / profile.category.value
-    category_backup.mkdir(parents=True, exist_ok=True)
-
     for suffix in (".info", ".json"):
-        src = profile.directory / f"{profile.name}{suffix}"
-        if src.exists():
-            dst = category_backup / f"{profile.name}{suffix}"
-            # Handle collision: append counter if destination exists
-            if dst.exists():
-                counter = 1
-                while dst.exists():
-                    dst = category_backup / f"{profile.name}_{counter}{suffix}"
-                    counter += 1
-            shutil.move(str(src), str(dst))
+        backup_move(profile.directory / f"{profile.name}{suffix}", backup_dir, profile.category.value)
 
 
 # ---------------------------------------------------------------------------
@@ -294,20 +281,7 @@ def find_broken_references(
 
 def _backup_json(profile: Profile, backup_dir: Path) -> None:
     """Copy a profile's .json file to the backup directory (preserving original)."""
-    category_backup = backup_dir / profile.category.value
-    category_backup.mkdir(parents=True, exist_ok=True)
-
-    src = profile.json_path
-    if not src.exists():
-        return
-
-    dst = category_backup / f"{profile.name}.json"
-    if dst.exists():
-        counter = 1
-        while dst.exists():
-            dst = category_backup / f"{profile.name}_{counter}.json"
-            counter += 1
-    shutil.copy2(str(src), str(dst))
+    backup_copy(profile.json_path, backup_dir, profile.category.value)
 
 
 def execute_remap(
@@ -319,9 +293,7 @@ def execute_remap(
 
     Returns the number of profiles successfully modified.
     """
-    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    timestamped_backup = backup_dir / timestamp
-    timestamped_backup.mkdir(parents=True, exist_ok=True)
+    timestamped_backup = create_backup_dir(backup_dir)
     console.print(f"[dim]Backing up to: {timestamped_backup}[/dim]")
 
     # Collect all modifications per profile (a profile may appear in multiple actions)
@@ -368,28 +340,25 @@ def execute_remap(
         if printers == original:
             continue
 
-        # Back up before first modification
-        if path not in backed_up:
-            _backup_json(profile_by_path[path], timestamped_backup)
-            backed_up.add(path)
-
-        if not printers:
-            # No remaining printers — archive the profile entirely
-            profile = profile_by_path[path]
-            _archive_profile(profile, timestamped_backup)
-            console.print(f"  [yellow]Archived[/yellow] {path.name} (no remaining printers)")
-            modified += 1
-        else:
-            data["compatible_printers"] = printers
-            try:
-                path.write_text(
-                    json.dumps(data, indent=4, ensure_ascii=False) + "\n",
-                    encoding="utf-8",
-                )
+        try:
+            if not printers:
+                # No remaining printers — archive the profile entirely.
+                # The archive moves the original files, so no copy backup needed.
+                profile = profile_by_path[path]
+                _archive_profile(profile, timestamped_backup)
+                console.print(f"  [yellow]Archived[/yellow] {path.name} (no remaining printers)")
+                modified += 1
+            else:
+                # Back up before first modification
+                if path not in backed_up:
+                    _backup_json(profile_by_path[path], timestamped_backup)
+                    backed_up.add(path)
+                data["compatible_printers"] = printers
+                atomic_write_json(path, data)
                 console.print(f"  [green]Updated[/green] {path.name}")
                 modified += 1
-            except OSError as e:
-                console.print(f"  [red]Failed to write[/red] {path.name}: {e}")
+        except Exception as e:
+            console.print(f"  [red]Failed[/red] {path.name}: {e}")
 
     return modified
 
@@ -575,9 +544,7 @@ def execute_link_fixes(
 
     Returns number of profiles updated.
     """
-    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    timestamped_backup = backup_dir / timestamp
-    timestamped_backup.mkdir(parents=True, exist_ok=True)
+    timestamped_backup = create_backup_dir(backup_dir)
     console.print(f"[dim]Backing up to: {timestamped_backup}[/dim]")
 
     updated = 0
@@ -585,6 +552,14 @@ def execute_link_fixes(
         path = profile.json_path
         if not path.exists():
             console.print(f"  [red]Missing[/red] {path.name}")
+            continue
+
+        if not new_printers:
+            # Empty compatible_printers means "visible to ALL printers" —
+            # never write it; archive the profile instead.
+            _archive_profile(profile, timestamped_backup)
+            console.print(f"  [yellow]Archived[/yellow] {profile.name} (no compatible printers)")
+            updated += 1
             continue
 
         try:
@@ -597,13 +572,159 @@ def execute_link_fixes(
         data["compatible_printers"] = new_printers
 
         try:
-            path.write_text(
-                json.dumps(data, indent=4, ensure_ascii=False) + "\n",
-                encoding="utf-8",
-            )
+            atomic_write_json(path, data)
             console.print(f"  [green]Updated[/green] {profile.name} -> {new_printers}")
             updated += 1
         except OSError as e:
             console.print(f"  [red]Failed to write[/red] {path.name}: {e}")
 
     return updated
+
+
+# ---------------------------------------------------------------------------
+# Printer removal
+# ---------------------------------------------------------------------------
+
+
+def find_printer_dependents(
+    profiles: dict[ProfileCategory, list[Profile]],
+    machine_name: str,
+) -> tuple[list[Profile], list[Profile]]:
+    """Return (exclusive, shared) filament/process profiles referencing a machine.
+
+    Exclusive profiles list only this machine in compatible_printers;
+    shared profiles list it alongside others.
+    """
+    exclusive: list[Profile] = []
+    shared: list[Profile] = []
+    for category in (ProfileCategory.FILAMENT, ProfileCategory.PROCESS):
+        for profile in profiles.get(category, []):
+            cp = profile.compatible_printers
+            if machine_name in cp:
+                if len(set(cp)) == 1:
+                    exclusive.append(profile)
+                else:
+                    shared.append(profile)
+    return exclusive, shared
+
+
+@dataclass
+class DupeResolution:
+    """A chosen resolution for a duplicate group: keep one, archive the rest."""
+
+    keep: Profile
+    archive: list[Profile]
+    merged_printers: list[str] | None = None  # None = don't touch keeper's cp
+
+
+def execute_dupe_resolutions(
+    console: Console,
+    resolutions: list[DupeResolution],
+    backup_dir: Path,
+) -> int:
+    """Apply duplicate-resolution choices: archive losers, optionally merge cp.
+
+    Each resolution archives its `archive` list. If `merged_printers` is a
+    non-empty list differing from the keeper's current compatible_printers,
+    the keeper's .json is backed up then rewritten with the merged list. An
+    empty `merged_printers` list is never written (empty means "visible to
+    ALL printers"); a warning is printed and the keeper is left unchanged.
+
+    Returns the number of groups successfully resolved.
+    """
+    timestamped_backup = create_backup_dir(backup_dir)
+    console.print(f"[dim]Backing up to: {timestamped_backup}[/dim]")
+
+    resolved = 0
+
+    for resolution in resolutions:
+        try:
+            for loser in resolution.archive:
+                _archive_profile(loser, timestamped_backup)
+                console.print(
+                    f"  [yellow]Archived[/yellow] [{loser.category.value}] {loser.name} "
+                    f"(duplicate of '{resolution.keep.name}')"
+                )
+
+            if resolution.merged_printers is not None:
+                if not resolution.merged_printers:
+                    console.print(
+                        f"  [yellow]Warning:[/yellow] merged compatible_printers for "
+                        f"'{resolution.keep.name}' would be empty; leaving unchanged."
+                    )
+                elif sorted(resolution.merged_printers) != sorted(resolution.keep.compatible_printers):
+                    path = resolution.keep.json_path
+                    if not path.exists():
+                        console.print(f"  [red]Missing[/red] {path.name}")
+                    else:
+                        data = json.loads(path.read_text(encoding="utf-8"))
+                        _backup_json(resolution.keep, timestamped_backup)
+                        data["compatible_printers"] = resolution.merged_printers
+                        atomic_write_json(path, data)
+                        console.print(
+                            f"  [green]Merged compatible_printers[/green] for "
+                            f"'{resolution.keep.name}' -> {resolution.merged_printers}"
+                        )
+
+            console.print(f"  [bold green]Kept[/bold green] {resolution.keep.name}")
+            resolved += 1
+        except Exception as e:
+            console.print(f"  [red]Failed[/red] resolving duplicates for '{resolution.keep.name}': {e}")
+
+    return resolved
+
+
+def execute_printer_removal(
+    console: Console,
+    target_machine: Profile,
+    exclusive: list[Profile],
+    shared: list[Profile],
+    backup_dir: Path,
+) -> int:
+    """Archive a machine + its exclusive profiles; strip it from shared ones.
+
+    If stripping the machine from a shared profile would leave an empty
+    compatible_printers list, the profile is archived instead (empty means
+    "visible to ALL printers" in OrcaSlicer).
+
+    Returns the number of profiles processed.
+    """
+    timestamped_backup = create_backup_dir(backup_dir)
+    console.print(f"[dim]Backing up to: {timestamped_backup}[/dim]")
+
+    processed = 0
+
+    _archive_profile(target_machine, timestamped_backup)
+    console.print(f"  [yellow]Archived[/yellow] [machine] {target_machine.name}")
+    processed += 1
+
+    for profile in exclusive:
+        _archive_profile(profile, timestamped_backup)
+        console.print(f"  [yellow]Archived[/yellow] [{profile.category.value}] {profile.name}")
+        processed += 1
+
+    machine_name = target_machine.name
+    for profile in shared:
+        path = profile.json_path
+        if not path.exists():
+            continue
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            cp = data.get("compatible_printers", [])
+            remaining = [p for p in cp if p != machine_name]
+            if not remaining:
+                _archive_profile(profile, timestamped_backup)
+                console.print(
+                    f"  [yellow]Archived[/yellow] [{profile.category.value}] "
+                    f"{profile.name} (no remaining printers)"
+                )
+            else:
+                _backup_json(profile, timestamped_backup)
+                data["compatible_printers"] = remaining
+                atomic_write_json(path, data)
+                console.print(f"  [green]Updated[/green] [{profile.category.value}] {profile.name}")
+            processed += 1
+        except (json.JSONDecodeError, OSError) as e:
+            console.print(f"  [red]Failed[/red] {profile.name}: {e}")
+
+    return processed

@@ -38,7 +38,6 @@ class TestLayerHeightPadding:
         "ASA - 3DO (LGX Lite Pro - TeaKettle - 0.4mm)",
         "PETG - 3DO (LGX Lite Pro, TeaKettle 0.4mm)",
         "ABS - Fillamentum (0.4mm)",
-        "Snapmaker U1 - 0.40mm",
     ])
     def test_does_not_pad_nozzle_sizes(self, input_name):
         assert _normalize_name(input_name) == input_name
@@ -46,6 +45,35 @@ class TestLayerHeightPadding:
     def test_already_padded_unchanged(self):
         assert _normalize_name("0.20mm - Production") == "0.20mm - Production"
         assert _normalize_name("0.08mm - HQ") == "0.08mm - HQ"
+
+
+class TestNozzleMinimalForm:
+    """Rule 4: nozzle sizes (mm values NOT at the start of a name) drop
+    trailing zeros — the mirror image of layer-height padding."""
+
+    @pytest.mark.parametrize("input_name,expected", [
+        ("Snapmaker U1 - 0.40mm", "Snapmaker U1 - 0.4mm"),
+        ("HTPLA - Protopasta - U1 - 0.40mm", "HTPLA - Protopasta - U1 - 0.4mm"),
+        ("ABS - 3DO (LGX Lite Pro - TeaKettle - 0.40mm)", "ABS - 3DO (LGX Lite Pro - TeaKettle - 0.4mm)"),
+        ("0.20mm - Draft (RatRig V-Core 3.1 - 0.50mm)", "0.20mm - Draft (RatRig V-Core 3.1 - 0.5mm)"),
+        ("Some Printer - 1.0mm", "Some Printer - 1mm"),
+    ])
+    def test_strips_trailing_zeros_from_nozzle_sizes(self, input_name, expected):
+        assert _normalize_name(input_name) == expected
+
+    @pytest.mark.parametrize("input_name", [
+        "0.20mm - Production",           # leading layer height stays padded
+        "0.40mm - K3 - Whistles",        # 0.40 layer height is valid, not a nozzle
+        "Doomcube - LGX Lite Pro - TeaKettle - 0.4mm",  # already minimal
+    ])
+    def test_does_not_touch_layer_heights_or_minimal_nozzles(self, input_name):
+        assert _normalize_name(input_name) == input_name
+
+    def test_layer_height_padding_and_nozzle_stripping_coexist(self):
+        assert (
+            _normalize_name("0.2mm - Draft (Doomcube - 0.40mm)")
+            == "0.20mm - Draft (Doomcube - 0.4mm)"
+        )
 
 
 class TestSpacedHyphens:

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import datetime
 import json
 import re
 import shutil
@@ -12,6 +11,7 @@ from pathlib import Path
 from rich.console import Console
 from rich.table import Table
 
+from .fileops import atomic_write_json, backup_copy, create_backup_dir, record_rename
 from .models import Profile, ProfileCategory
 
 
@@ -71,7 +71,18 @@ def _normalize_name(name: str) -> str:
     # "TK" -> "TeaKettle" etc.
     result = _expand_abbreviations(result)
 
-    # Rule 4: Collapse multiple spaces
+    # Rule 4: Nozzle sizes drop trailing zeros: "0.40mm" -> "0.4mm".
+    # Applies to mm values anywhere EXCEPT the start of the name — leading
+    # values are layer heights, which Rule 1 pads the other way ("0.20mm").
+    def _minimal_nozzle(m: re.Match) -> str:
+        if m.start() == 0:
+            return m.group(0)
+        num = m.group(1).rstrip("0").rstrip(".")
+        return f"{num}mm"
+
+    result = re.sub(r"(\d+\.\d*0)mm\b", _minimal_nozzle, result)
+
+    # Rule 5: Collapse multiple spaces
     result = re.sub(r"  +", " ", result)
 
     return result
@@ -363,10 +374,10 @@ def execute_renames(
 
     Returns the number of profiles successfully renamed.
     """
-    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    timestamped_backup = backup_dir / timestamp
-    timestamped_backup.mkdir(parents=True, exist_ok=True)
+    timestamped_backup = create_backup_dir(backup_dir)
     console.print(f"[dim]Backing up to: {timestamped_backup}[/dim]")
+
+    actions = _preflight_renames(console, actions)
 
     machine_actions = [a for a in actions if a.profile.category == ProfileCategory.MACHINE]
     other_actions = [a for a in actions if a.profile.category != ProfileCategory.MACHINE]
@@ -388,7 +399,7 @@ def execute_renames(
             )
 
     if machine_remap:
-        _cascade_machine_renames(console, machine_remap, all_profiles)
+        _cascade_machine_renames(console, machine_remap, all_profiles, timestamped_backup)
 
     # Build model+nozzle lookup for process profile compatible_printers broadening
     machines_by_model_nozzle: dict[tuple[str, str], list[str]] = {}
@@ -419,6 +430,40 @@ def execute_renames(
             )
 
     return renamed
+
+
+def _preflight_renames(
+    console: Console, actions: list[RenameAction]
+) -> list[RenameAction]:
+    """Drop rename actions whose target already exists on disk or collides
+    with another action in the batch. Prevents partial renames that would
+    split a profile into mismatched .info/.json names."""
+    ok: list[RenameAction] = []
+    claimed: set[tuple[Path, str]] = set()
+
+    for action in actions:
+        target_key = (action.profile.directory, action.new_name)
+        if target_key in claimed:
+            console.print(
+                f"  [red]Skipped[/red] {action.old_name}: another profile in this "
+                f"batch also renames to '{action.new_name}'"
+            )
+            continue
+        existing = [
+            action.profile.directory / f"{action.new_name}{suffix}"
+            for suffix in (".info", ".json")
+            if (action.profile.directory / f"{action.new_name}{suffix}").exists()
+        ]
+        if existing:
+            console.print(
+                f"  [red]Skipped[/red] {action.old_name}: target "
+                f"'{existing[0].name}' already exists"
+            )
+            continue
+        claimed.add(target_key)
+        ok.append(action)
+
+    return ok
 
 
 def _broaden_process_printers(
@@ -460,10 +505,7 @@ def _broaden_process_printers(
 
     if current_cp != set(target_cp):
         data["compatible_printers"] = target_cp
-        json_path.write_text(
-            json.dumps(data, indent=4, ensure_ascii=False) + "\n",
-            encoding="utf-8",
-        )
+        atomic_write_json(json_path, data)
         added = set(target_cp) - current_cp
         if added:
             console.print(
@@ -476,12 +518,14 @@ def _cascade_machine_renames(
     console: Console,
     remap: dict[str, str],
     all_profiles: dict[ProfileCategory, list[Profile]] | None,
+    backup_dir: Path,
 ) -> None:
     """Update compatible_printers in filament/process profiles after machine renames."""
     if not all_profiles:
         return
 
     updated = 0
+    failed = 0
     for category in (ProfileCategory.FILAMENT, ProfileCategory.PROCESS):
         for profile in all_profiles.get(category, []):
             json_path = profile.directory / f"{profile.name}.json"
@@ -498,38 +542,89 @@ def _cascade_machine_renames(
 
             new_cp = [remap.get(p, p) for p in cp]
             if new_cp != cp:
-                data["compatible_printers"] = new_cp
-                json_path.write_text(
-                    json.dumps(data, indent=4, ensure_ascii=False) + "\n",
-                    encoding="utf-8",
-                )
-                updated += 1
+                try:
+                    backup_copy(json_path, backup_dir, category.value)
+                    data["compatible_printers"] = new_cp
+                    atomic_write_json(json_path, data)
+                    updated += 1
+                except OSError as e:
+                    failed += 1
+                    console.print(
+                        f"  [red]Failed to update[/red] {json_path.name}: {e} "
+                        f"— still references the old machine name"
+                    )
 
     if updated:
         console.print(
             f"  [cyan]Updated compatible_printers in {updated} profile(s) "
             f"to match renamed machine(s).[/cyan]"
         )
+    if failed:
+        console.print(
+            f"  [red]{failed} profile(s) could not be updated and still "
+            f"reference the old machine name(s) — run 'ocs fix --only remap' "
+            f"to repair.[/red]"
+        )
 
 
 def _execute_single_rename(action: RenameAction, backup_dir: Path) -> None:
-    """Rename a single profile: backup, update JSON, rename files."""
+    """Rename a single profile: check targets, back up, rename files, update JSON.
+
+    Ordered so a failure can't leave a split profile: both targets are
+    verified free before anything is touched, both files are renamed (with
+    rollback if the second rename fails), and only then are the JSON
+    internals updated in the already-renamed file.
+    """
     profile = action.profile
-    category_backup = backup_dir / profile.category.value
-    category_backup.mkdir(parents=True, exist_ok=True)
+
+    # Verify both targets are free before touching anything
+    for suffix in (".info", ".json"):
+        dst = profile.directory / f"{action.new_name}{suffix}"
+        if dst.exists():
+            raise FileExistsError(f"Target already exists: {dst.name}")
 
     # Back up existing files
     for suffix in (".info", ".json"):
-        src = profile.directory / f"{action.old_name}{suffix}"
-        if src.exists():
-            dst = category_backup / f"{action.old_name}{suffix}"
-            shutil.copy2(str(src), str(dst))
+        backup_copy(
+            profile.directory / f"{action.old_name}{suffix}",
+            backup_dir,
+            profile.category.value,
+        )
 
-    # Update JSON contents if the file exists
-    json_src = profile.directory / f"{action.old_name}.json"
-    if json_src.exists():
+    # Rename files on disk, rolling back if the second rename fails
+    renamed_pairs: list[tuple[Path, Path]] = []
+    try:
+        for suffix in (".info", ".json"):
+            src = profile.directory / f"{action.old_name}{suffix}"
+            dst = profile.directory / f"{action.new_name}{suffix}"
+            if src.exists():
+                src.rename(dst)
+                renamed_pairs.append((src, dst))
+    except OSError as e:
+        rollback_failed: list[Path] = []
+        for src, dst in reversed(renamed_pairs):
+            try:
+                shutil.move(str(dst), str(src))
+            except OSError:
+                rollback_failed.append(dst)
+        if rollback_failed:
+            names = ", ".join(p.name for p in rollback_failed)
+            raise OSError(
+                f"{e}; rollback ALSO failed for {names} — profile may be "
+                f"split across old/new names; originals are in {backup_dir}"
+            ) from e
+        raise
+
+    # Record the renames so restore can remove the new-name files when
+    # putting the old-name backups back (otherwise both pairs would exist).
+    for src, dst in renamed_pairs:
+        record_rename(backup_dir, src, dst)
+
+    # Update JSON internals in the renamed file
+    json_dst = profile.directory / f"{action.new_name}.json"
+    if json_dst.exists():
         try:
-            data = json.loads(json_src.read_text(encoding="utf-8"))
+            data = json.loads(json_dst.read_text(encoding="utf-8"))
             modified = False
 
             for field in _SETTINGS_ID_FIELDS:
@@ -538,20 +633,6 @@ def _execute_single_rename(action: RenameAction, backup_dir: Path) -> None:
                     modified = True
 
             if modified:
-                json_src.write_text(
-                    json.dumps(data, indent=4, ensure_ascii=False) + "\n",
-                    encoding="utf-8",
-                )
+                atomic_write_json(json_dst, data)
         except (json.JSONDecodeError, OSError):
-            pass  # If we can't update internals, still rename the file
-
-    # Rename files on disk
-    for suffix in (".info", ".json"):
-        src = profile.directory / f"{action.old_name}{suffix}"
-        dst = profile.directory / f"{action.new_name}{suffix}"
-        if src.exists():
-            if dst.exists():
-                raise FileExistsError(
-                    f"Target already exists: {dst.name}"
-                )
-            src.rename(dst)
+            pass  # If we can't update internals, the rename still stands

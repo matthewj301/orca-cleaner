@@ -104,7 +104,12 @@ class Profile:
         return self.settings.get("name")
 
     def settings_without_metadata(self) -> dict[str, Any]:
-        """Return settings with volatile metadata stripped for comparison."""
+        """Return settings with volatile metadata stripped for comparison.
+
+        "name" is stripped too: it mirrors the filename, so including it
+        would make identically-tuned profiles with different names hash as
+        different content and hide real duplicates.
+        """
         skip = {
             "setting_id",
             "updated_time",
@@ -113,6 +118,7 @@ class Profile:
             "print_settings_id",
             "filament_settings_id",
             "printer_settings_id",
+            "name",
         }
         return {k: v for k, v in sorted(self.settings.items()) if k not in skip}
 
@@ -134,7 +140,7 @@ class DuplicateGroup:
 
     profiles: list[Profile]
     similarity_score: float
-    match_type: str  # "exact_content", "name_similar", "content_similar"
+    match_type: str  # "exact_content", "mergeable", "name_similar", "content_similar"
     details: str = ""
 
     @property

@@ -13,6 +13,22 @@ CLI tool to validate, deduplicate, and clean up OrcaSlicer user profiles.
   refuse to run against the default profile dir while the app is open
   (`_ensure_app_closed` in cli.py); recovery from such deletions = restore the
   .json AND rewrite `sync_info = delete` -> `update`, with the app closed.
+- Deleting a machine in the OrcaSlicer UI produces the SAME delete-signature
+  (writes `sync_info = delete`, removes the `.json`) and makes dependent
+  filament/process profiles vanish from any sibling printer in the app view —
+  even though their on-disk `compatible_printers` are untouched. Recover by
+  restoring the machine `.json` from the off-disk git snapshot
+  (`~/git/orcaslicer-profiles-backup`, which diffs cleanly against live) and
+  rewriting `sync_info = delete` -> `update`, app closed. To retire a machine,
+  prefer `ocs remove-printer` over UI deletion — it cascades the links safely.
+- Cloning a machine in the UI does NOT copy filament/process links: those
+  profiles reference the OLD machine name by exact string in
+  `compatible_printers`, so the new machine sees nothing. To give a new machine
+  its sibling's profiles, APPEND the new machine name to `compatible_printers`
+  on every profile bound to the source machine (append, never replace — the old
+  machine must keep working). `cleaner.execute_link_fixes` is the safe primitive
+  (backup + atomic write + `fix-links` manifest, so `ocs undo` works); there is
+  no dedicated CLI command for this yet (candidate feature: `clone-printer-links`).
 - Every mutation backs up to `_backup/` (timestamped dir) BEFORE writing and is
   gated: `clean` requires `--execute`; `fix` and `remove-printer` prompt
   interactively. `ocs restore` is the undo. Archive, never hard-delete.

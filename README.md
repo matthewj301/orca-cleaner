@@ -18,8 +18,8 @@ I built this for my own setup — 7 printers, 300+ profiles, years of "I'll clea
 ## Install
 
 ```bash
-git clone https://github.com/yourusername/orcaslicer-cleaner.git
-cd orcaslicer-cleaner
+git clone https://github.com/matthewj301/orca-cleaner.git
+cd orca-cleaner
 pip install -r requirements.txt
 ```
 
@@ -58,6 +58,10 @@ Changed your mind? `ocs restore` brings a snapshot back. There's no step here yo
 OrcaSlicer keeps its profiles in sync with its cloud account, and it doesn't expect them to change while it's open. If a profile file changes underneath the running app, OrcaSlicer can treat it as a conflict and remove the profile. To prevent that, anything that edits your profiles will pause and ask you to quit OrcaSlicer first.
 
 Looking and copying are always fine. `scan`, `diff`, and `backup` only read (or copy) your files, so you're welcome to run them with OrcaSlicer open. It's only the commands that change things — `fix`, `clean`, `remove-printer` — that need the app closed.
+
+> **⚠️ Windows and Linux users, please read this.** This tool was built and tested on macOS. Two things matter for you:
+> - **The default profile paths are macOS-only.** You must point the tool at your own OrcaSlicer folders with `--profile-dir` (and usually `--system-profiles`) on every command — for example `ocs --profile-dir "C:\Users\you\AppData\Roaming\OrcaSlicer\user" scan`.
+> - **The automatic "is OrcaSlicer running?" safety check only works on macOS.** On Windows/Linux it can't detect the app, so the tool will *not* stop you from editing profiles while OrcaSlicer is open. That's exactly the situation that can make OrcaSlicer delete profiles. **You must quit OrcaSlicer yourself before running any command that changes profiles**, and take a `backup` first. Cross-platform support for this guard is planned.
 
 ## Usage
 

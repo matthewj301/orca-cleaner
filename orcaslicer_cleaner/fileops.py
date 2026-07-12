@@ -64,6 +64,32 @@ def create_backup_dir(backup_root: Path, operation: str | None = None) -> Path:
     return backup_dir
 
 
+def mirror_backup_dir(backup_dir: Path, mirror_root: Path) -> Path | None:
+    """Copy a completed timestamped backup into an additional root.
+
+    `ocs restore`/`ocs undo` only ever read the default `_backup` root, so the
+    real backup always lives there; a user-supplied `--backup-dir` is honored as
+    an *extra* self-contained copy (manifest included) rather than a replacement.
+    This keeps undo working no matter what flags a mutation was run with.
+
+    The mirror keeps the same timestamped directory name; on the rare collision
+    a numeric suffix is appended, matching create_backup_dir's scheme. Returns
+    the mirror path, or None if the copy failed (mirroring is best-effort — a
+    failed extra copy must never abort the mutation whose real backup succeeded).
+    """
+    try:
+        mirror_root.mkdir(parents=True, exist_ok=True)
+        dest = mirror_root / backup_dir.name
+        counter = 1
+        while dest.exists():
+            dest = mirror_root / f"{backup_dir.name}_{counter}"
+            counter += 1
+        shutil.copytree(backup_dir, dest)
+        return dest
+    except OSError:
+        return None
+
+
 def load_operation(backup_dir: Path) -> str | None:
     """Return the operation label recorded in a backup's manifest, if any."""
     op = _load_manifest_data(backup_dir).get("operation", {})

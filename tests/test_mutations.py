@@ -382,6 +382,59 @@ class TestPrinterRemoval:
 # ---------------------------------------------------------------------------
 
 
+class TestBackup:
+    def _run_backup(self, profile_tree, *args):
+        runner = CliRunner()
+        return runner.invoke(
+            cli,
+            ["--profile-dir", str(profile_tree), "--system-profiles", "/nonexistent", "backup", *args],
+        )
+
+    def test_backup_snapshots_whole_library_with_manifest(self, profile_tree):
+        result = self._run_backup(profile_tree)
+        assert result.exit_code == 0, result.output
+
+        backup_dir = next((profile_tree.parent / "_backup").iterdir())
+        # Every profile pair in the fixture is present in the snapshot.
+        for category, name in [
+            ("machine", MACHINE_A),
+            ("filament", "PLA - Shared"),
+            ("process", "0.20mm - Standard (Doomcube - 0.4mm)"),
+        ]:
+            assert (backup_dir / category / f"{name}.json").exists()
+            assert (backup_dir / category / f"{name}.info").exists()
+
+        # Provenance + restore path both work off the manifest.
+        from orcaslicer_cleaner.fileops import load_operation
+        assert load_operation(backup_dir) == "backup"
+        manifest = load_manifest(backup_dir)
+        assert manifest["filament/PLA - Shared.json"] == str(
+            profile_tree / "1234567890" / "filament" / "PLA - Shared.json"
+        )
+
+    def test_backup_leaves_originals_in_place(self, profile_tree):
+        before = {p for p in (profile_tree / "1234567890").rglob("*") if p.is_file()}
+        result = self._run_backup(profile_tree)
+        assert result.exit_code == 0, result.output
+        after = {p for p in (profile_tree / "1234567890").rglob("*") if p.is_file()}
+        assert before == after  # copy-only: nothing moved or deleted
+
+    def test_backup_round_trips_through_restore(self, profile_tree):
+        assert self._run_backup(profile_tree).exit_code == 0
+        target_json = profile_tree / "1234567890" / "filament" / "PLA - Shared.json"
+        target_json.unlink()
+
+        backup_dir = next((profile_tree.parent / "_backup").iterdir())
+        runner = CliRunner()
+        result = runner.invoke(
+            cli,
+            ["--profile-dir", str(profile_tree), "--system-profiles", "/nonexistent",
+             "restore", backup_dir.name, "--force"],
+        )
+        assert result.exit_code == 0, result.output
+        assert target_json.exists()
+
+
 class TestRestore:
     def _archive(self, profile_tree, console, name="PLA - Shared"):
         profiles = load_tree(profile_tree)
@@ -567,3 +620,59 @@ class TestRestore:
         assert result.exit_code == 0, result.output
         assert t1.json_path.exists()
         assert not t2.json_path.exists()
+
+
+class TestBackupMirroring:
+    """A user-supplied --backup-dir is an ADDITIONAL copy, never a replacement:
+    the canonical backup always lands in the default _backup so restore/undo
+    keep working regardless of flags."""
+
+    def test_execute_actions_mirrors_to_extra_root(self, profile_tree, console, tmp_path):
+        profiles = load_tree(profile_tree)
+        target = get_profile(profiles, ProfileCategory.FILAMENT, "PLA - Shared")
+        primary_root = tmp_path / "_backup"
+        mirror_root = tmp_path / "external"
+
+        actions = [CleanAction(action="archive", profile=target, reason="test")]
+        assert execute_actions(console, actions, primary_root, mirror_root=mirror_root) == 1
+
+        primary = next(primary_root.iterdir())
+        mirror = next(mirror_root.iterdir())
+        # Same timestamped name, and the mirror is self-contained (files + manifest)
+        assert mirror.name == primary.name
+        assert (mirror / "filament" / "PLA - Shared.json").exists()
+        assert (mirror / "filament" / "PLA - Shared.info").exists()
+        assert load_manifest(mirror) == load_manifest(primary)
+
+    def test_resolve_backup_roots_collapses_identical_dir(self, tmp_path):
+        from orcaslicer_cleaner.cli import _resolve_backup_roots
+
+        profile_dir = tmp_path / "user"
+        default_root = tmp_path / "_backup"
+
+        # No custom dir -> no mirror
+        primary, mirror = _resolve_backup_roots(profile_dir, None)
+        assert primary == default_root and mirror is None
+
+        # Custom dir pointing at the default -> no redundant mirror
+        primary, mirror = _resolve_backup_roots(profile_dir, default_root)
+        assert primary == default_root and mirror is None
+
+        # A genuinely different custom dir -> becomes the mirror
+        custom = tmp_path / "external"
+        primary, mirror = _resolve_backup_roots(profile_dir, custom)
+        assert primary == default_root and mirror == custom
+
+    def test_mirror_failure_does_not_abort_mutation(self, profile_tree, console, tmp_path):
+        """A broken mirror destination must not prevent the real backup/mutation."""
+        profiles = load_tree(profile_tree)
+        target = get_profile(profiles, ProfileCategory.FILAMENT, "PLA - Shared")
+        primary_root = tmp_path / "_backup"
+        # A file (not a dir) where the mirror root should be -> mkdir/copy fails
+        bad_mirror = tmp_path / "blocked"
+        bad_mirror.write_text("not a directory")
+
+        actions = [CleanAction(action="archive", profile=target, reason="test")]
+        assert execute_actions(console, actions, primary_root, mirror_root=bad_mirror) == 1
+        assert not target.json_path.exists()  # mutation still happened
+        assert (next(primary_root.iterdir()) / "filament" / "PLA - Shared.json").exists()

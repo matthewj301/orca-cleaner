@@ -11,6 +11,7 @@ from rich.console import Console
 from rich.table import Table
 from rich.text import Text
 
+from .config import DEFAULT_CONFIG, Config
 from .deduplicator import _parse_filament_name, _parse_process_name
 from .models import Profile, ProfileCategory
 
@@ -23,20 +24,20 @@ def _machine_model(machine_name: str) -> str:
     return machine_name.split(" - ", 1)[0].strip()
 
 
-def _filament_row_key(profile: Profile) -> str:
+def _filament_row_key(profile: Profile, config: Config = DEFAULT_CONFIG) -> str:
     """Row label for a filament profile: 'Material - Brand', or the full
     name if it doesn't match the expected naming convention."""
-    parsed = _parse_filament_name(profile.name)
+    parsed = _parse_filament_name(profile.name, config)
     if parsed is None:
         return profile.name
     material, brand, _hardware = parsed
     return f"{material} - {brand}"
 
 
-def _process_row_key(profile: Profile) -> str:
+def _process_row_key(profile: Profile, config: Config = DEFAULT_CONFIG) -> str:
     """Row label for a process profile: 'LayerHeight - Purpose', or the
     full name if it doesn't match the expected naming convention."""
-    parsed = _parse_process_name(profile.name)
+    parsed = _parse_process_name(profile.name, config)
     if parsed is None:
         return profile.name
     layer_height, purpose, _hardware = parsed
@@ -144,7 +145,11 @@ def _render_matrix(
     )
 
 
-def print_filament_matrix(console: Console, profiles: dict[ProfileCategory, list[Profile]]) -> None:
+def print_filament_matrix(
+    console: Console,
+    profiles: dict[ProfileCategory, list[Profile]],
+    config: Config = DEFAULT_CONFIG,
+) -> None:
     """Print a Material-Brand x Machine coverage matrix for filament profiles."""
     filaments = profiles.get(ProfileCategory.FILAMENT, [])
     machines = sorted({p.name for p in profiles.get(ProfileCategory.MACHINE, [])})
@@ -152,7 +157,10 @@ def print_filament_matrix(console: Console, profiles: dict[ProfileCategory, list
     def column_for_ref(ref: str, columns: list[str]) -> str:
         return ref if ref in columns else UNKNOWN_COLUMN
 
-    matrix, empty_cp, total = _build_matrix(filaments, machines, _filament_row_key, column_for_ref)
+    def row_key(p: Profile) -> str:
+        return _filament_row_key(p, config)
+
+    matrix, empty_cp, total = _build_matrix(filaments, machines, row_key, column_for_ref)
 
     _render_matrix(
         console,
@@ -167,7 +175,11 @@ def print_filament_matrix(console: Console, profiles: dict[ProfileCategory, list
     )
 
 
-def print_process_matrix(console: Console, profiles: dict[ProfileCategory, list[Profile]]) -> None:
+def print_process_matrix(
+    console: Console,
+    profiles: dict[ProfileCategory, list[Profile]],
+    config: Config = DEFAULT_CONFIG,
+) -> None:
     """Print a LayerHeight-Purpose x Printer-Model coverage matrix for
     process profiles. Columns are deduped printer models rather than full
     machine names, since process profiles are model-scoped."""
@@ -182,7 +194,10 @@ def print_process_matrix(console: Console, profiles: dict[ProfileCategory, list[
             return model
         return UNKNOWN_COLUMN
 
-    matrix, empty_cp, total = _build_matrix(processes, models, _process_row_key, column_for_ref)
+    def row_key(p: Profile) -> str:
+        return _process_row_key(p, config)
+
+    matrix, empty_cp, total = _build_matrix(processes, models, row_key, column_for_ref)
 
     _render_matrix(
         console,

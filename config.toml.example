@@ -1,0 +1,89 @@
+# OrcaSlicer Profile Cleaner — example configuration
+#
+# Copy this to ~/.config/orcaslicer-cleaner/config.toml (or point at it with
+# --config PATH) and edit to taste. Every setting is optional: anything you
+# leave out keeps its built-in default, so a config that only sets one value
+# changes only that one thing.
+#
+# The defaults shown below reproduce the tool's original behavior, so an empty
+# config file behaves exactly like no config file at all.
+
+
+# --- Vocabulary -------------------------------------------------------------
+# These map the shorthand you use in profile names to the fuller terms the tool
+# matches against. Each section, if present, REPLACES the default wholesale —
+# so list every entry you want, not just the new ones. (The defaults below are
+# the author's own hardware; most people will want to replace them entirely.)
+
+# Short forms expanded when standardizing names, e.g. "TK" -> "TeaKettle".
+[abbreviations]
+TK = "TeaKettle"
+
+# Informal hardware names in profile names mapped to the terms that appear in
+# your machine profile names, e.g. a filament tagged "(Mako)" should match a
+# "Bambu" machine.
+[hardware_aliases]
+mako = "bambu"
+tk = "teakettle"
+
+# System-preset shorthand (seen in a profile's `inherits` value) mapped to your
+# machine's model name, so the tool can suggest the right printer.
+[model_aliases]
+bbl = "bambu lab"
+x1c = "x1 carbon"
+p1s = "p1s"
+u1 = "snapmaker u1"
+
+
+# --- Thresholds -------------------------------------------------------------
+# Numeric knobs. The fuzz_* values are 0–100 similarity scores; higher = stricter.
+[thresholds]
+stale_days = 365            # a profile not updated in this many days is "stale"
+content_similarity = 0.95   # above this, a near-duplicate is flagged as content-similar
+fuzz_material = 90          # how closely filament materials must match to be duplicates
+fuzz_brand = 90             # ...and brands
+fuzz_hardware = 95          # ...and hardware (stricter — different hardware is a real difference)
+fuzz_process_purpose = 90   # how closely process "purpose" text must match
+fuzz_process_hardware = 95  # ...and process hardware
+diff_match_cutoff = 50      # "did you mean?" suggestion cutoff in `ocs diff`
+blast_category_pct = 0.15   # warn if a cleanup archives more than this fraction of a category
+blast_category_floor = 3    # ...but only once it touches at least this many profiles
+blast_bulk = 20             # warn if a single cleanup archives at least this many profiles
+unassigned_group_threshold = 15  # group the review list once there are more than this many
+
+
+# --- Naming -----------------------------------------------------------------
+# Formatting rules applied when standardizing names. These toggles work today:
+[naming]
+pad_layer_heights = true    # "0.2mm" -> "0.20mm" at the start of a name
+trim_nozzle_zeros = true    # "0.40mm" -> "0.4mm" in a nozzle position
+normalize_hyphens = true    # tidy spaced hyphens into " - "
+
+# The format templates below describe your naming convention: the order of the
+# fields and the separators between them. They drive how the tool UNDERSTANDS
+# your names — duplicate detection and the coverage matrix. Field names are
+# meaningful: filament uses {material}/{brand}/{hardware}, process uses
+# {layer}/{purpose}/{hardware}. {layer} and {nozzle} must look like a dimension
+# (e.g. 0.4mm). {hardware} captures everything inside its parentheses.
+#
+# These templates drive how the tool UNDERSTANDS names (duplicate detection and
+# the coverage matrix) AND how it BUILDS them during `ocs fix --only names`:
+# standardization uses your configured separator and hardware bracket, so if you
+# write hardware in [square] brackets the tool appends/normalizes [square]
+# brackets — it won't tack on a stray (round) one.
+#
+# What's NOT applied yet: full field REORDERING during standardization. If your
+# format puts fields in a different order than the built-in one, the tool tidies
+# in place (spacing, nozzle sizes, brackets) rather than rewriting a name into a
+# wholly different field order. The `hardware` sub-template is reserved for that
+# fuller rendering step and is not used yet.
+[naming.filament]
+format = "{material} - {brand} ({hardware})"
+hardware = "{extruder} - {hotend} - {nozzle}"
+
+[naming.process]
+format = "{layer} - {purpose} ({hardware})"
+hardware = "{model} - {nozzle}"
+
+[naming.machine]
+format = "{model} - {extruder} - {hotend} - {nozzle}"

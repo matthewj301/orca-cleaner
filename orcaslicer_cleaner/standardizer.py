@@ -11,7 +11,15 @@ from pathlib import Path
 from rich.console import Console
 from rich.table import Table
 
-from .fileops import atomic_write_json, backup_copy, create_backup_dir, record_rename
+from .config import DEFAULT_CONFIG, Config
+from .naming import RenderSpec, render_spec
+from .fileops import (
+    atomic_write_json,
+    backup_copy,
+    create_backup_dir,
+    mirror_backup_dir,
+    record_rename,
+)
 from .models import Profile, ProfileCategory
 
 
@@ -42,14 +50,16 @@ _SPACED_HYPHEN_RE = re.compile(
     r"(?<=\S)\s+-\s*(?=\S)|(?<=\S)\s*-\s+(?=\S)"
 )
 
-# Known abbreviations to expand in hardware portions of names
-_ABBREVIATIONS = {
-    "TK": "TeaKettle",
-}
+# Abbreviations to expand in hardware portions of names now live in
+# config.abbreviations (default {"TK": "TeaKettle"}).
 
 
-def _normalize_name(name: str) -> str:
-    """Apply all naming standardization rules to a profile name."""
+def _normalize_name(name: str, config: Config = DEFAULT_CONFIG) -> str:
+    """Apply all naming standardization rules to a profile name.
+
+    Which rules run is governed by ``config.naming`` toggles; the abbreviation
+    map comes from ``config.abbreviations``. Defaults reproduce the original
+    hardcoded behavior (all rules on, TK -> TeaKettle)."""
     result = name
 
     # Rule 1: Normalize layer heights to 2 decimal places.
@@ -60,16 +70,18 @@ def _normalize_name(name: str) -> str:
         # Only pad if there's exactly one decimal digit
         return f"{num}0mm"
 
-    result = _LAYER_HEIGHT_RE.sub(_fix_layer_height, result)
+    if config.naming.pad_layer_heights:
+        result = _LAYER_HEIGHT_RE.sub(_fix_layer_height, result)
 
     # Rule 2: Normalize spaced hyphens to " - ".
     # Only touches hyphens that already have at least one space on one side,
     # preserving compound words like "V-Core", "ASA-CF", "Metal-Filled".
-    result = _SPACED_HYPHEN_RE.sub(" - ", result)
+    if config.naming.normalize_hyphens:
+        result = _SPACED_HYPHEN_RE.sub(" - ", result)
 
     # Rule 3: Expand known abbreviations in hardware parenthetical.
     # "TK" -> "TeaKettle" etc.
-    result = _expand_abbreviations(result)
+    result = _expand_abbreviations(result, config)
 
     # Rule 4: Nozzle sizes drop trailing zeros: "0.40mm" -> "0.4mm".
     # ONLY in nozzle positions — the very end of the name or the end of a
@@ -83,7 +95,8 @@ def _normalize_name(name: str) -> str:
         num = m.group(1).rstrip("0").rstrip(".")
         return f"{num}mm{m.group(2)}"
 
-    result = re.sub(r"(\d+\.\d*0)mm(\s*\)?\s*)$", _minimal_nozzle, result)
+    if config.naming.trim_nozzle_zeros:
+        result = re.sub(r"(\d+\.\d*0)mm(\s*\)?\s*)$", _minimal_nozzle, result)
 
     # Rule 5: Collapse multiple spaces
     result = re.sub(r"  +", " ", result)
@@ -91,9 +104,9 @@ def _normalize_name(name: str) -> str:
     return result
 
 
-def _expand_abbreviations(name: str) -> str:
+def _expand_abbreviations(name: str, config: Config = DEFAULT_CONFIG) -> str:
     """Expand known hardware abbreviations within the name."""
-    for abbrev, full in _ABBREVIATIONS.items():
+    for abbrev, full in config.abbreviations.items():
         # Match abbreviation as a whole word (bounded by spaces, hyphens, or parens)
         pattern = re.compile(
             r"(?<=[\s(,-])" + re.escape(abbrev) + r"(?=[\s),-]|$)"
@@ -102,27 +115,31 @@ def _expand_abbreviations(name: str) -> str:
     return name
 
 
-# Match a nozzle-only parenthetical at the end of a name
-_NOZZLE_ONLY_PAREN_RE = re.compile(r"\((\d+\.?\d*mm)\)\s*$")
-
-# Any trailing parenthetical at all (hardware, material descriptor, ...)
-_ANY_TRAILING_PAREN_RE = re.compile(r"\([^)]*\)\s*$")
+# Default render specs (separator + hardware bracket) for the built-in
+# convention, so the name-building helpers work standalone with default
+# behavior when no config-derived spec is threaded in.
+_DEFAULT_FIL_SPEC = render_spec(DEFAULT_CONFIG.naming.filament.format)
+_DEFAULT_PROC_SPEC = render_spec(DEFAULT_CONFIG.naming.process.format)
 
 
 def _append_hardware(
     name: str,
     profile: Profile,
     machine_hw: dict[str, str],
+    spec: RenderSpec = _DEFAULT_FIL_SPEC,
 ) -> str | None:
-    """If a filament profile has NO trailing parenthetical and its
+    """If a filament profile has NO trailing hardware bracket and its
     compatible_printers resolve to exactly one hardware path, return `name`
-    with "(Extruder - Hotend - NozzleSize)" appended. Otherwise None.
+    with the hardware bracket appended (e.g. "(Extruder - Hotend - NozzleSize)"
+    for the default convention, or the configured bracket). Otherwise None.
 
-    Names that already end in any parenthetical are left alone — the
-    contents may be a material descriptor ("(Satin PLA)") or a hardware
-    nickname, and both need human judgment, not automation.
+    Names that already end in a hardware bracket are left alone — the contents
+    may be a material descriptor ("(Satin PLA)") or a hardware nickname, and
+    both need human judgment, not automation.
     """
-    if _ANY_TRAILING_PAREN_RE.search(name):
+    if not spec.has_hardware:
+        return None
+    if spec.trailing_hardware_re().search(name):
         return None
 
     printers = profile.compatible_printers
@@ -139,31 +156,34 @@ def _append_hardware(
     if len(hw_paths) != 1:
         return None  # ambiguous across differently-equipped machines
 
-    return f"{name.rstrip()} ({hw_paths.pop()})"
+    return f"{name.rstrip()}{spec.wrap_hardware(hw_paths.pop())}"
 
 
-def _extract_hardware_from_machine(machine_name: str) -> str | None:
+def _extract_hardware_from_machine(machine_name: str, sep: str = " - ") -> str | None:
     """Extract the hardware path from a machine profile name.
 
-    Machine names follow "PrinterModel - Extruder - Hotend - NozzleSize".
-    Returns everything after the first segment, or None if there's only
-    a nozzle size (e.g., "Bambu Lab X1 Carbon - 0.4mm").
+    Machine names follow "PrinterModel<sep>Extruder<sep>Hotend<sep>NozzleSize".
+    Returns everything after the first segment (re-joined with `sep`), or None
+    if there's only a nozzle size (e.g., "Bambu Lab X1 Carbon - 0.4mm").
     """
-    parts = [p.strip() for p in machine_name.split(" - ")]
+    parts = [p.strip() for p in machine_name.split(sep)]
     if len(parts) < 3:
         return None  # Just "Model - 0.4mm" — no useful hardware info
-    hw = " - ".join(parts[1:])
-    return hw
+    return sep.join(parts[1:])
 
 
 def _inject_hardware(
     profile: Profile,
     machine_names: dict[str, str],
+    spec: RenderSpec = _DEFAULT_FIL_SPEC,
 ) -> str | None:
-    """If profile has a nozzle-only parenthetical and compatible_printers
+    """If profile has a nozzle-only hardware bracket and compatible_printers
     can resolve to a hardware path, return the new name. Otherwise None.
     """
-    m = _NOZZLE_ONLY_PAREN_RE.search(profile.name)
+    if not spec.has_hardware:
+        return None
+    nozzle_only_re = spec.trailing_hardware_re(inner=r"\d+\.?\d*mm")
+    m = nozzle_only_re.search(profile.name)
     if not m:
         return None
 
@@ -182,7 +202,11 @@ def _inject_hardware(
         return None  # Ambiguous or no hardware info
 
     hw_path = hw_paths.pop()
-    new_name = _NOZZLE_ONLY_PAREN_RE.sub(f"({hw_path})", profile.name)
+    # Function replacement: insert the bracketed hardware literally, so any
+    # backslash/group-ref metacharacters in the hardware string aren't
+    # interpreted by re.sub.
+    replacement = spec.bracket_hardware(hw_path)
+    new_name = nozzle_only_re.sub(lambda _m: replacement, profile.name)
     return new_name if new_name != profile.name else None
 
 
@@ -193,14 +217,21 @@ def _inject_hardware(
 
 def find_renames(
     profiles: dict[ProfileCategory, list[Profile]],
+    config: Config = DEFAULT_CONFIG,
 ) -> list[RenameAction]:
     """Scan all profiles and identify those needing name normalization."""
     actions: list[RenameAction] = []
 
+    # Naming-convention pieces (separator + hardware bracket) come from the
+    # configured format templates, so name-building honors a custom convention.
+    fil_spec = render_spec(config.naming.filament.format)
+    proc_spec = render_spec(config.naming.process.format)
+    machine_sep = render_spec(config.naming.machine.format).separator
+
     # Build machine hardware lookup for hardware injection (filament profiles)
     machine_hw: dict[str, str] = {}
     for p in profiles.get(ProfileCategory.MACHINE, []):
-        hw = _extract_hardware_from_machine(p.name)
+        hw = _extract_hardware_from_machine(p.name, machine_sep)
         if hw:
             machine_hw[p.name] = hw
 
@@ -208,27 +239,27 @@ def find_renames(
     machine_models: dict[str, str] = {}  # machine_name -> printer model
     machines_by_model: dict[str, list[str]] = {}  # model -> [machine_names]
     for p in profiles.get(ProfileCategory.MACHINE, []):
-        model = _extract_printer_model(p.name)
+        model = _extract_printer_model(p.name, machine_sep)
         machine_models[p.name] = model
         machines_by_model.setdefault(model, []).append(p.name)
 
     for category in ProfileCategory:
         for profile in profiles.get(category, []):
-            new_name = _normalize_name(profile.name)
+            new_name = _normalize_name(profile.name, config)
 
             if category == ProfileCategory.FILAMENT:
-                injected = _inject_hardware(profile, machine_hw)
+                injected = _inject_hardware(profile, machine_hw, fil_spec)
                 if injected:
-                    new_name = _normalize_name(injected)
+                    new_name = _normalize_name(injected, config)
                 else:
-                    appended = _append_hardware(new_name, profile, machine_hw)
+                    appended = _append_hardware(new_name, profile, machine_hw, fil_spec)
                     if appended:
                         new_name = appended
-                new_name = _normalize_filament_paren(new_name, profile, machine_hw)
+                new_name = _normalize_filament_paren(new_name, profile, machine_hw, fil_spec)
 
             elif category == ProfileCategory.PROCESS:
                 new_name = _normalize_process_paren(
-                    new_name, profile, machine_models, machines_by_model
+                    new_name, profile, machine_models, machines_by_model, proc_spec
                 )
 
             if new_name != profile.name:
@@ -243,9 +274,9 @@ def find_renames(
     return actions
 
 
-def _extract_printer_model(machine_name: str) -> str:
+def _extract_printer_model(machine_name: str, sep: str = " - ") -> str:
     """Extract the printer model (first segment) from a machine profile name."""
-    parts = [p.strip() for p in machine_name.split(" - ")]
+    parts = [p.strip() for p in machine_name.split(sep)]
     return parts[0]
 
 
@@ -260,14 +291,17 @@ def _normalize_process_paren(
     profile: Profile,
     machine_models: dict[str, str],
     machines_by_model: dict[str, list[str]],
+    spec: RenderSpec = _DEFAULT_PROC_SPEC,
 ) -> str:
-    """Normalize process profile parenthetical to (PrinterModel - NozzleSize).
+    """Normalize process profile hardware bracket to (PrinterModel - NozzleSize).
 
     Process profiles are determined by printer motion capability, not by
-    extruder/hotend hardware. The parenthetical should identify which printer
-    and nozzle size, not the full hardware path.
+    extruder/hotend hardware. The bracket should identify which printer and
+    nozzle size, not the full hardware path.
     """
-    m = re.search(r"\(([^)]+)\)\s*$", name)
+    if not spec.has_hardware:
+        return name
+    m = spec.trailing_hardware_re().search(name)
     if not m:
         return name
 
@@ -302,7 +336,7 @@ def _normalize_process_paren(
         return name
 
     # Check if already in the correct format
-    target_paren = f"{printer_model} - {nozzle}"
+    target_paren = f"{printer_model}{spec.separator}{nozzle}"
     if paren_content == target_paren:
         return name
 
@@ -314,13 +348,17 @@ def _normalize_filament_paren(
     name: str,
     profile: Profile,
     machine_hw: dict[str, str],
+    spec: RenderSpec = _DEFAULT_FIL_SPEC,
 ) -> str:
-    """Normalize the hardware parenthetical in a filament profile name
-    to match the machine's hardware format exactly.
+    """Normalize the hardware bracket in a filament profile name to match the
+    machine's hardware format exactly.
 
-    Fixes comma separators -> ' - ' and nozzle size format to match machine.
+    Fixes comma separators -> the configured separator and nozzle size format
+    to match the machine.
     """
-    m = re.search(r"\(([^)]+)\)\s*$", name)
+    if not spec.has_hardware:
+        return name
+    m = spec.trailing_hardware_re().search(name)
     if not m:
         return name
 
@@ -338,14 +376,14 @@ def _normalize_filament_paren(
             break
 
     if not target_hw:
-        normalized = re.sub(r"\s*,\s*", " - ", paren_content)
+        normalized = re.sub(r"\s*,\s*", spec.separator, paren_content)
         normalized = re.sub(r"\s+", " ", normalized)
         if normalized != paren_content:
             return name[:m.start(1)] + normalized + name[m.end(1):]
         return name
 
-    paren_normalized = re.sub(r"\s*[,]\s*", " - ", paren_content)
-    paren_normalized = re.sub(r"(?<=\S)\s+(?=\d+\.?\d*mm)", " - ", paren_normalized)
+    paren_normalized = re.sub(r"\s*[,]\s*", spec.separator, paren_content)
+    paren_normalized = re.sub(r"(?<=\S)\s+(?=\d+\.?\d*mm)", spec.separator, paren_normalized)
     paren_normalized = re.sub(r"\s+", " ", paren_normalized).strip()
 
     paren_tokens = {t.strip().lower() for t in re.split(r"[-,]", paren_normalized) if t.strip()}
@@ -409,6 +447,8 @@ def execute_renames(
     actions: list[RenameAction],
     backup_dir: Path,
     all_profiles: dict[ProfileCategory, list[Profile]] | None = None,
+    mirror_root: Path | None = None,
+    config: Config = DEFAULT_CONFIG,
 ) -> int:
     """Apply rename actions: back up files, rename on disk, update JSON internals.
 
@@ -417,6 +457,8 @@ def execute_renames(
 
     Returns the number of profiles successfully renamed.
     """
+    machine_sep = render_spec(config.naming.machine.format).separator
+    proc_spec = render_spec(config.naming.process.format)
     timestamped_backup = create_backup_dir(backup_dir, "fix-names")
     console.print(f"[dim]Backing up to: {timestamped_backup}[/dim]")
 
@@ -448,7 +490,7 @@ def execute_renames(
     machines_by_model_nozzle: dict[tuple[str, str], list[str]] = {}
     if all_profiles:
         for p in all_profiles.get(ProfileCategory.MACHINE, []):
-            model = _extract_printer_model(p.name)
+            model = _extract_printer_model(p.name, machine_sep)
             nozzle = _extract_nozzle_from_machine(p.name)
             if model and nozzle:
                 machines_by_model_nozzle.setdefault((model, nozzle), []).append(p.name)
@@ -465,13 +507,19 @@ def execute_renames(
             # machines of the same model + nozzle size
             if action.profile.category == ProfileCategory.PROCESS:
                 _broaden_process_printers(
-                    action, machines_by_model_nozzle, console
+                    action, machines_by_model_nozzle, console, proc_spec
                 )
         except Exception as e:
             console.print(
                 f"  [red]Failed[/red] {action.old_name}: {e}"
             )
 
+    if mirror_root is not None:
+        dest = mirror_backup_dir(timestamped_backup, mirror_root)
+        if dest is not None:
+            console.print(f"[dim]Also copied backup to: {dest}[/dim]")
+        else:
+            console.print(f"[yellow]Could not copy backup to {mirror_root}[/yellow]")
     return renamed
 
 
@@ -513,16 +561,20 @@ def _broaden_process_printers(
     action: RenameAction,
     machines_by_model_nozzle: dict[tuple[str, str], list[str]],
     console: Console,
+    spec: RenderSpec = _DEFAULT_PROC_SPEC,
 ) -> None:
     """After renaming a process profile to (Model - Nozzle), set its
     compatible_printers to include ALL machines of that model+nozzle."""
-    # Extract model and nozzle from the new name's parenthetical
-    m = re.search(r"\(([^)]+)\)\s*$", action.new_name)
+    # Extract model and nozzle from the new name's hardware bracket, using the
+    # configured bracket + separator so a custom convention still broadens.
+    if not spec.has_hardware:
+        return
+    m = spec.trailing_hardware_re().search(action.new_name)
     if not m:
         return
 
     paren = m.group(1)
-    parts = [p.strip() for p in paren.split(" - ")]
+    parts = [p.strip() for p in paren.split(spec.separator)]
     if len(parts) != 2:
         return
 

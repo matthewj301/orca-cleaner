@@ -39,7 +39,9 @@ from .fileops import (
     load_manifest,
     load_operation,
     load_renames,
+    mirror_backup_dir,
 )
+from .config import DEFAULT_CONFIG, Config, ConfigError, load_config
 from .deduplicator import find_duplicates, recommend_keep
 from .models import Profile, ProfileCategory
 from .safety import assess_blast_radius, coverage_lost, coverage_snapshot, new_broken_refs
@@ -96,6 +98,28 @@ def _ensure_app_closed(profile_dir: Path) -> bool:
     return False
 
 
+def _resolve_backup_roots(
+    profile_dir: Path, backup_dir: Path | None
+) -> tuple[Path, Path | None]:
+    """Resolve where a mutation's backup is written.
+
+    The default `_backup` (next to the profile dir) is always the canonical
+    store — `ocs restore`/`ocs undo` only ever read it, so undo must not depend
+    on which flags a command was run with. A user-supplied `--backup-dir` is
+    honored as an *additional* mirror, not a replacement. Returns
+    (primary_root, mirror_root); mirror_root is None when no distinct custom
+    dir was given.
+    """
+    default_root = profile_dir.parent / "_backup"
+    if backup_dir is None:
+        return default_root, None
+    try:
+        same = backup_dir.resolve() == default_root.resolve()
+    except OSError:
+        same = backup_dir == default_root
+    return default_root, (None if same else backup_dir)
+
+
 def _post_mutation_report(profile_dir: Path, before_profiles, before_snapshot) -> None:
     """Reload profiles after a mutation and report any coverage lost or new
     broken references, so silent damage doesn't go unnoticed."""
@@ -129,11 +153,24 @@ def _post_mutation_report(profile_dir: Path, before_profiles, before_snapshot) -
     help="Path to OrcaSlicer system profiles directory.",
     show_default=True,
 )
+@click.option(
+    "--config",
+    "config_path",
+    type=click.Path(path_type=Path),
+    default=None,
+    help="Path to a TOML config file. Default: ~/.config/orcaslicer-cleaner/config.toml if present.",
+)
 @click.pass_context
-def cli(ctx: click.Context, profile_dir: Path, system_profiles: Path) -> None:
+def cli(ctx: click.Context, profile_dir: Path, system_profiles: Path, config_path: Path | None) -> None:
     """OrcaSlicer Profile Cleaner - validate, deduplicate, and clean up profiles."""
     ctx.ensure_object(dict)
     ctx.obj["profile_dir"] = profile_dir
+
+    try:
+        ctx.obj["config"] = load_config(config_path)
+    except ConfigError as e:
+        stderr_console.print(f"[red]Config error:[/red] {e}")
+        raise SystemExit(2)
 
     if system_profiles.is_dir():
         sys_names = load_system_profile_names(system_profiles)
@@ -164,8 +201,8 @@ def cli(ctx: click.Context, profile_dir: Path, system_profiles: Path) -> None:
 @cli.command()
 @click.option("--json-output", is_flag=True, help="Output as JSON instead of rich tables.")
 @click.option(
-    "--stale-days", type=int, default=365,
-    help="Days after which a profile is considered stale.", show_default=True,
+    "--stale-days", type=int, default=None,
+    help="Days after which a profile is considered stale (default: from config, 365).",
 )
 @click.option(
     "--min-severity",
@@ -173,17 +210,19 @@ def cli(ctx: click.Context, profile_dir: Path, system_profiles: Path) -> None:
     default="info", help="Minimum severity to display.", show_default=True,
 )
 @click.pass_context
-def scan(ctx: click.Context, json_output: bool, stale_days: int, min_severity: str) -> None:
+def scan(ctx: click.Context, json_output: bool, stale_days: int | None, min_severity: str) -> None:
     """Full scan: validation, duplicates, link issues, and naming."""
     from .models import IssueSeverity
 
     profile_dir: Path = ctx.obj["profile_dir"]
+    cfg = ctx.obj["config"]
     profiles = _load(profile_dir)
     if profiles is None:
         return
 
-    issues = validate_all(profiles, stale_days=stale_days, system_names=ctx.obj["system_names"])
-    dupe_groups = find_duplicates(profiles)
+    effective_stale = stale_days if stale_days is not None else cfg.thresholds.stale_days
+    issues = validate_all(profiles, stale_days=effective_stale, system_names=ctx.obj["system_names"])
+    dupe_groups = find_duplicates(profiles, config=cfg)
 
     severity_level = {"error": 0, "warning": 1, "info": 2}
     min_level = severity_level[min_severity.lower()]
@@ -201,7 +240,7 @@ def scan(ctx: click.Context, json_output: bool, stale_days: int, min_severity: s
     reporter.print_duplicates(console, dupe_groups)
 
     # Link audit
-    link_issues = audit_links(profiles)
+    link_issues = audit_links(profiles, cfg)
     if link_issues:
         console.print()
         empty_links = [i for i in link_issues if i.issue == "empty"]
@@ -228,7 +267,7 @@ def scan(ctx: click.Context, json_output: bool, stale_days: int, min_severity: s
             console.print(table)
 
     # Naming issues
-    rename_actions = find_renames(profiles)
+    rename_actions = find_renames(profiles, cfg)
     if rename_actions:
         console.print()
         console.print(Panel(
@@ -254,7 +293,7 @@ def scan(ctx: click.Context, json_output: bool, stale_days: int, min_severity: s
 
 @cli.command()
 @click.option("--execute", is_flag=True, help="Apply cleanup. Without this flag, only previews.")
-@click.option("--backup-dir", type=click.Path(path_type=Path), default=None, help="Directory to archive removed profiles.")
+@click.option("--backup-dir", type=click.Path(path_type=Path), default=None, help="Extra directory to mirror the backup into (the default _backup is always written so restore/undo keep working).")
 @click.option(
     "--type", "clean_types", multiple=True,
     type=click.Choice(["stale", "invalid", "dupes", "orphaned-hw", "broken-inherits"], case_sensitive=False),
@@ -275,17 +314,20 @@ def clean(
 ) -> None:
     """Archive profiles by type: stale, invalid, dupes, orphaned-hw, broken-inherits."""
     profile_dir: Path = ctx.obj["profile_dir"]
+    cfg = ctx.obj["config"]
     profiles = _load(profile_dir)
     if profiles is None:
         return
 
-    issues = validate_all(profiles, system_names=ctx.obj["system_names"])
-    dupe_groups = find_duplicates(profiles)
+    issues = validate_all(
+        profiles, stale_days=cfg.thresholds.stale_days, system_names=ctx.obj["system_names"]
+    )
+    dupe_groups = find_duplicates(profiles, config=cfg)
     types = clean_types or None
 
     orphaned_link_issues = None
     if types is None or "orphaned-hw" in types:
-        orphaned_link_issues = audit_links(profiles)
+        orphaned_link_issues = audit_links(profiles, cfg)
 
     actions = plan_cleanup(issues, dupe_groups, types=types, orphaned_link_issues=orphaned_link_issues)
     actions = filter_actions_by_printer(actions, printer or None, exclude_printer or None)
@@ -303,23 +345,23 @@ def clean(
     if not _ensure_app_closed(profile_dir):
         return
 
-    if backup_dir is None:
-        backup_dir = profile_dir.parent / "_backup"
+    backup_dir, mirror_root = _resolve_backup_roots(profile_dir, backup_dir)
 
     preview_actions(console, actions)
     console.print()
 
     to_archive = [a.profile for a in actions]
-    assessment = assess_blast_radius(profiles, to_archive)
+    assessment = assess_blast_radius(profiles, to_archive, config=cfg)
     snapshot = coverage_snapshot(profiles)
 
-    if not _confirm_with_blast_radius(
-        assessment, f"Execute {len(actions)} action(s)? Files will be backed up to {backup_dir}"
-    ):
+    prompt = f"Execute {len(actions)} action(s)? Files will be backed up to {backup_dir}"
+    if mirror_root is not None:
+        prompt += f" (and mirrored to {mirror_root})"
+    if not _confirm_with_blast_radius(assessment, prompt):
         console.print("[yellow]Aborted.[/yellow]")
         return
 
-    count = execute_actions(console, actions, backup_dir)
+    count = execute_actions(console, actions, backup_dir, mirror_root=mirror_root)
     console.print(f"\n[green]Done. {count}/{len(actions)} actions completed.[/green]")
     _post_mutation_report(profile_dir, profiles, snapshot)
 
@@ -330,19 +372,19 @@ def clean(
 
 
 @cli.command("remove-printer")
-@click.option("--backup-dir", type=click.Path(path_type=Path), default=None, help="Directory to archive removed profiles.")
+@click.option("--backup-dir", type=click.Path(path_type=Path), default=None, help="Extra directory to mirror the backup into (the default _backup is always written so restore/undo keep working).")
 @click.pass_context
 def remove_printer(ctx: click.Context, backup_dir: Path | None) -> None:
     """Remove a printer and archive all filament/process profiles exclusively linked to it."""
     profile_dir: Path = ctx.obj["profile_dir"]
+    cfg = ctx.obj["config"]
     if not _ensure_app_closed(profile_dir):
         return
     profiles = _load(profile_dir)
     if profiles is None:
         return
 
-    if backup_dir is None:
-        backup_dir = profile_dir.parent / "_backup"
+    backup_dir, mirror_root = _resolve_backup_roots(profile_dir, backup_dir)
 
     machines = sorted(profiles.get(ProfileCategory.MACHINE, []), key=lambda p: p.name)
     if not machines:
@@ -387,7 +429,7 @@ def remove_printer(ctx: click.Context, backup_dir: Path | None) -> None:
         console.print()
 
     to_archive = [target_machine] + exclusive
-    assessment = assess_blast_radius(profiles, to_archive, to_modify=shared)
+    assessment = assess_blast_radius(profiles, to_archive, to_modify=shared, config=cfg)
     snapshot = coverage_snapshot(profiles)
 
     if not _confirm_with_blast_radius(
@@ -397,7 +439,9 @@ def remove_printer(ctx: click.Context, backup_dir: Path | None) -> None:
         console.print("[yellow]Aborted.[/yellow]")
         return
 
-    total = execute_printer_removal(console, target_machine, exclusive, shared, backup_dir)
+    total = execute_printer_removal(
+        console, target_machine, exclusive, shared, backup_dir, mirror_root=mirror_root
+    )
     console.print(f"\n[green]Done. {total} profile(s) processed.[/green]")
     _post_mutation_report(profile_dir, profiles, snapshot)
 
@@ -408,7 +452,7 @@ def remove_printer(ctx: click.Context, backup_dir: Path | None) -> None:
 
 
 @cli.command()
-@click.option("--backup-dir", type=click.Path(path_type=Path), default=None, help="Directory for file backups.")
+@click.option("--backup-dir", type=click.Path(path_type=Path), default=None, help="Extra directory to mirror backups into (the default _backup is always written so restore/undo keep working).")
 @click.option(
     "--only", "fix_types", multiple=True,
     type=click.Choice(["remap", "links", "dupes", "names"], case_sensitive=False),
@@ -421,14 +465,14 @@ def fix(ctx: click.Context, backup_dir: Path | None, fix_types: tuple[str, ...])
     Walks through each fixable issue category and lets you review and apply.
     """
     profile_dir: Path = ctx.obj["profile_dir"]
+    cfg = ctx.obj["config"]
     if not _ensure_app_closed(profile_dir):
         return
     profiles = _load(profile_dir)
     if profiles is None:
         return
 
-    if backup_dir is None:
-        backup_dir = profile_dir.parent / "_backup"
+    backup_dir, mirror_root = _resolve_backup_roots(profile_dir, backup_dir)
 
     run_all = not fix_types
     did_something = False
@@ -448,31 +492,31 @@ def fix(ctx: click.Context, backup_dir: Path | None, fix_types: tuple[str, ...])
 
     # --- Phase 1: Broken reference remap ---
     if run_all or "remap" in fix_types:
-        if _fix_remap(profiles, backup_dir, profile_dir):
+        if _fix_remap(profiles, backup_dir, profile_dir, mirror_root, cfg):
             did_something = True
             _reload()
 
     # --- Phase 2: Link audit (empty/mismatched compatible_printers) ---
     if run_all or "links" in fix_types:
-        if _fix_links(profiles, backup_dir, profile_dir):
+        if _fix_links(profiles, backup_dir, profile_dir, mirror_root, cfg):
             did_something = True
             _reload()
 
     # --- Phase 3: Duplicate resolution ---
     if run_all or "dupes" in fix_types:
-        if _fix_dupes(profiles, backup_dir, profile_dir):
+        if _fix_dupes(profiles, backup_dir, profile_dir, mirror_root, cfg):
             did_something = True
             _reload()
 
     # --- Phase 4: Name standardization ---
     if run_all or "names" in fix_types:
-        did_something |= _fix_names(profiles, backup_dir, profile_dir)
+        did_something |= _fix_names(profiles, backup_dir, profile_dir, mirror_root, cfg)
 
     if not did_something:
         console.print("\n[green]Nothing to fix — all clean![/green]")
 
 
-def _fix_remap(profiles: dict[ProfileCategory, list], backup_dir: Path, profile_dir: Path) -> bool:
+def _fix_remap(profiles: dict[ProfileCategory, list], backup_dir: Path, profile_dir: Path, mirror_root: Path | None = None, config: Config = DEFAULT_CONFIG) -> bool:
     """Interactive broken reference remap. Returns True if any work was done."""
     broken = find_broken_references(profiles)
     if not broken:
@@ -532,12 +576,12 @@ def _fix_remap(profiles: dict[ProfileCategory, list], backup_dir: Path, profile_
     console.print()
     total_affected = sum(len(a.affected_profiles) for a in actions)
     to_modify = [p for a in actions for p in a.affected_profiles]
-    assessment = assess_blast_radius(profiles, [], to_modify=to_modify)
+    assessment = assess_blast_radius(profiles, [], to_modify=to_modify, config=config)
     snapshot = coverage_snapshot(profiles)
     if _confirm_with_blast_radius(
         assessment, f"Apply {len(actions)} remap action(s) affecting {total_affected} profile(s)?"
     ):
-        modified = execute_remap(console, actions, backup_dir)
+        modified = execute_remap(console, actions, backup_dir, mirror_root=mirror_root)
         console.print(f"[green]{modified} profile(s) updated.[/green]\n")
         _post_mutation_report(profile_dir, profiles, snapshot)
         return True
@@ -546,11 +590,11 @@ def _fix_remap(profiles: dict[ProfileCategory, list], backup_dir: Path, profile_
         return False
 
 
-def _fix_links(profiles: dict[ProfileCategory, list], backup_dir: Path, profile_dir: Path) -> bool:
+def _fix_links(profiles: dict[ProfileCategory, list], backup_dir: Path, profile_dir: Path, mirror_root: Path | None = None, config: Config = DEFAULT_CONFIG) -> bool:
     """Fix empty/mismatched compatible_printers, then interactively assign
     printers to profiles with empty compatible_printers and no hardware hint
     in their name. Returns True if either phase did work."""
-    did_something = _fix_links_known(profiles, backup_dir, profile_dir)
+    did_something = _fix_links_known(profiles, backup_dir, profile_dir, mirror_root, config)
 
     # Reload so the unassigned-profile phase doesn't act on stale data if
     # the known-issue phase above just mutated files.
@@ -559,17 +603,17 @@ def _fix_links(profiles: dict[ProfileCategory, list], backup_dir: Path, profile_
         if reloaded is not None:
             profiles = reloaded
 
-    if _fix_links_unassigned(profiles, backup_dir, profile_dir):
+    if _fix_links_unassigned(profiles, backup_dir, profile_dir, mirror_root, config):
         did_something = True
 
     return did_something
 
 
-def _fix_links_known(profiles: dict[ProfileCategory, list], backup_dir: Path, profile_dir: Path) -> bool:
+def _fix_links_known(profiles: dict[ProfileCategory, list], backup_dir: Path, profile_dir: Path, mirror_root: Path | None = None, config: Config = DEFAULT_CONFIG) -> bool:
     """Fix empty/mismatched compatible_printers where a hardware hint in the
     profile name lets audit_links determine the fix automatically. Returns
     True if any work was done."""
-    link_issues = audit_links(profiles)
+    link_issues = audit_links(profiles, config)
     fixable = [i for i in link_issues if i.issue != "orphaned"]
 
     if not fixable:
@@ -618,10 +662,10 @@ def _fix_links_known(profiles: dict[ProfileCategory, list], backup_dir: Path, pr
     fixes = [(issue.profile, issue.suggested_printers) for issue in fixable]
 
     to_modify = [issue.profile for issue in fixable]
-    assessment = assess_blast_radius(profiles, [], to_modify=to_modify)
+    assessment = assess_blast_radius(profiles, [], to_modify=to_modify, config=config)
     snapshot = coverage_snapshot(profiles)
     if _confirm_with_blast_radius(assessment, f"Update compatible_printers for {len(fixes)} profile(s)?"):
-        count = execute_link_fixes(console, fixes, backup_dir)
+        count = execute_link_fixes(console, fixes, backup_dir, mirror_root=mirror_root)
         console.print(f"[green]{count}/{len(fixes)} profile(s) updated.[/green]\n")
         _post_mutation_report(profile_dir, profiles, snapshot)
         return True
@@ -630,17 +674,15 @@ def _fix_links_known(profiles: dict[ProfileCategory, list], backup_dir: Path, pr
         return False
 
 
-# Above this count, unassigned profiles are grouped by category (process
-# first) and a count is printed, so a big backlog doesn't scroll off-screen
-# before the user gets any orientation.
-_UNASSIGNED_GROUP_THRESHOLD = 15
-
-
-def _fix_links_unassigned(profiles: dict[ProfileCategory, list], backup_dir: Path, profile_dir: Path) -> bool:
+def _fix_links_unassigned(profiles: dict[ProfileCategory, list], backup_dir: Path, profile_dir: Path, mirror_root: Path | None = None, config: Config = DEFAULT_CONFIG) -> bool:
     """Interactively assign printers to profiles with empty compatible_printers
     and no hardware hint in their name (audit_links can't fix these on its
     own). Returns True if any work was done."""
-    unassigned = find_unassigned(profiles)
+    # Above this count, unassigned profiles are grouped by category (process
+    # first) and a count is printed, so a big backlog doesn't scroll off-screen
+    # before the user gets any orientation.
+    group_threshold = config.thresholds.unassigned_group_threshold
+    unassigned = find_unassigned(profiles, config)
     if not unassigned:
         console.print("[green]No unassigned profiles to review.[/green]\n")
         return False
@@ -658,7 +700,7 @@ def _fix_links_unassigned(profiles: dict[ProfileCategory, list], backup_dir: Pat
         title="Unassigned Profiles", border_style="yellow",
     ))
 
-    if len(unassigned) > _UNASSIGNED_GROUP_THRESHOLD:
+    if len(unassigned) > group_threshold:
         console.print(
             f"[dim]{len(unassigned)} profiles to review — grouped by category "
             "(process first), one at a time.[/dim]\n"
@@ -728,14 +770,14 @@ def _fix_links_unassigned(profiles: dict[ProfileCategory, list], backup_dir: Pat
         summary += " (stopped early — remaining profiles skipped)"
 
     to_modify = [p for p, _ in assignments]
-    assessment = assess_blast_radius(profiles, to_archive=archives, to_modify=to_modify)
+    assessment = assess_blast_radius(profiles, to_archive=archives, to_modify=to_modify, config=config)
     snapshot = coverage_snapshot(profiles)
     if _confirm_with_blast_radius(assessment, f"Apply changes? {summary}"):
-        updated = execute_link_fixes(console, assignments, backup_dir) if assignments else 0
+        updated = execute_link_fixes(console, assignments, backup_dir, mirror_root=mirror_root) if assignments else 0
         archived = 0
         if archives:
             actions = [CleanAction(action="archive", profile=p, reason="No current printer match") for p in archives]
-            archived = execute_actions(console, actions, backup_dir)
+            archived = execute_actions(console, actions, backup_dir, mirror_root=mirror_root)
         console.print(
             f"[green]{updated}/{len(assignments)} assigned, "
             f"{archived}/{len(archives)} archived.[/green]\n"
@@ -767,10 +809,10 @@ def _fmt_printers(printers: list[str], max_len: int = 60) -> str:
     return joined
 
 
-def _fix_dupes(profiles: dict[ProfileCategory, list], backup_dir: Path, profile_dir: Path) -> bool:
+def _fix_dupes(profiles: dict[ProfileCategory, list], backup_dir: Path, profile_dir: Path, mirror_root: Path | None = None, config: Config = DEFAULT_CONFIG) -> bool:
     """Interactively resolve duplicate/near-duplicate groups. Returns True if
     any work was done."""
-    groups = find_duplicates(profiles)
+    groups = find_duplicates(profiles, config=config)
     if not groups:
         console.print("[green]No duplicate profiles found.[/green]\n")
         return False
@@ -890,7 +932,7 @@ def _fix_dupes(profiles: dict[ProfileCategory, list], backup_dir: Path, profile_
     assessment = assess_blast_radius(profiles, to_archive, to_modify=to_modify)
     snapshot = coverage_snapshot(profiles)
     if _confirm_with_blast_radius(assessment, f"Apply resolutions? {summary}"):
-        count = execute_dupe_resolutions(console, resolutions, backup_dir)
+        count = execute_dupe_resolutions(console, resolutions, backup_dir, mirror_root=mirror_root)
         console.print(f"[green]{count}/{len(resolutions)} group(s) resolved.[/green]\n")
         _post_mutation_report(profile_dir, profiles, snapshot)
         return True
@@ -899,9 +941,9 @@ def _fix_dupes(profiles: dict[ProfileCategory, list], backup_dir: Path, profile_
         return False
 
 
-def _fix_names(profiles: dict[ProfileCategory, list], backup_dir: Path, profile_dir: Path) -> bool:
+def _fix_names(profiles: dict[ProfileCategory, list], backup_dir: Path, profile_dir: Path, mirror_root: Path | None = None, config: Config = DEFAULT_CONFIG) -> bool:
     """Fix naming inconsistencies. Returns True if any work was done."""
-    rename_actions = find_renames(profiles)
+    rename_actions = find_renames(profiles, config)
 
     if not rename_actions:
         console.print("[green]All profile names are standardized.[/green]\n")
@@ -924,10 +966,10 @@ def _fix_names(profiles: dict[ProfileCategory, list], backup_dir: Path, profile_
     console.print()
 
     to_modify = [a.profile for a in rename_actions]
-    assessment = assess_blast_radius(profiles, [], to_modify=to_modify)
+    assessment = assess_blast_radius(profiles, [], to_modify=to_modify, config=config)
     snapshot = coverage_snapshot(profiles)
     if _confirm_with_blast_radius(assessment, f"Rename {len(rename_actions)} profile(s)?"):
-        count = execute_renames(console, rename_actions, backup_dir, all_profiles=profiles)
+        count = execute_renames(console, rename_actions, backup_dir, all_profiles=profiles, mirror_root=mirror_root, config=config)
         console.print(f"[green]{count}/{len(rename_actions)} profile(s) renamed.[/green]\n")
         # Coverage is tracked by profile name, so an applied rename would
         # read as a "loss" in the post-op diff. Translate the before-snapshot
@@ -966,6 +1008,7 @@ def diff_cmd(ctx: click.Context, profile_a: str, profile_b: str, category: str |
     from rapidfuzz import fuzz, process as rfprocess
 
     profile_dir: Path = ctx.obj["profile_dir"]
+    diff_cutoff = ctx.obj["config"].thresholds.diff_match_cutoff
     profiles = _load(profile_dir)
     if profiles is None:
         return
@@ -988,7 +1031,7 @@ def diff_cmd(ctx: click.Context, profile_a: str, profile_b: str, category: str |
             return None
         candidate_names = [p.name for p in candidates]
         matches = rfprocess.extract(name, candidate_names, scorer=fuzz.ratio, limit=3)
-        if not matches or matches[0][1] < 50:
+        if not matches or matches[0][1] < diff_cutoff:
             stderr_console.print(f"[red]No close match for '{name}'.[/red]")
             return None
         best_name, best_score, _ = matches[0]
@@ -1034,6 +1077,60 @@ def diff_cmd(ctx: click.Context, profile_a: str, profile_b: str, category: str |
 
     console.print(table)
     console.print(f"\n[bold]{len(differ)}[/bold] differ, [red]{len(only_a)}[/red] only in A, [green]{len(only_b)}[/green] only in B, [dim]{len(common)}[/dim] in common")
+
+
+# ---------------------------------------------------------------------------
+# backup — snapshot the entire profile library
+# ---------------------------------------------------------------------------
+
+
+@cli.command()
+@click.option(
+    "--backup-dir", type=click.Path(path_type=Path), default=None,
+    help="Extra directory to also copy the snapshot into. The default "
+         "<profile-dir>/../_backup is always written so 'ocs restore' finds it.",
+)
+@click.pass_context
+def backup(ctx: click.Context, backup_dir: Path | None) -> None:
+    """Snapshot every profile into a timestamped backup (restore with 'ocs restore').
+
+    Unlike the automatic per-mutation backups (which only capture the files a
+    command touches), this copies the whole library. It only reads/copies the
+    live profiles, so it is safe to run while OrcaSlicer is open — back up
+    first, then quit the app before mutating.
+    """
+    profile_dir: Path = ctx.obj["profile_dir"]
+    profiles = _load(profile_dir)
+    if profiles is None:
+        return
+
+    backup_dir, mirror_root = _resolve_backup_roots(profile_dir, backup_dir)
+
+    all_profiles = [p for cat in ProfileCategory for p in profiles.get(cat, [])]
+    if not all_profiles:
+        console.print("[yellow]No profiles found to back up.[/yellow]")
+        return
+
+    dest = create_backup_dir(backup_dir, "backup")
+    copied = 0
+    for profile in all_profiles:
+        category = profile.category.value
+        if profile.has_info_file and backup_copy(profile.info_path, dest, category):
+            copied += 1
+        if profile.has_json_file and backup_copy(profile.json_path, dest, category):
+            copied += 1
+
+    console.print(
+        f"[green]Backed up {len(all_profiles)} profile(s) "
+        f"({copied} file(s)) to:[/green] {dest}"
+    )
+    if mirror_root is not None:
+        mirror = mirror_backup_dir(dest, mirror_root)
+        if mirror is not None:
+            console.print(f"[dim]Also copied to: {mirror}[/dim]")
+        else:
+            console.print(f"[yellow]Could not copy backup to {mirror_root}[/yellow]")
+    console.print(f"[dim]Restore with: ocs restore {dest.name}[/dim]")
 
 
 # ---------------------------------------------------------------------------
@@ -1288,16 +1385,17 @@ def matrix(ctx: click.Context, category: str | None) -> None:
     from . import matrix as matrix_mod
 
     profile_dir: Path = ctx.obj["profile_dir"]
+    cfg = ctx.obj["config"]
     profiles = _load(profile_dir)
     if profiles is None:
         return
 
     if category is None or category.lower() == "filament":
-        matrix_mod.print_filament_matrix(console, profiles)
+        matrix_mod.print_filament_matrix(console, profiles, cfg)
     if category is None:
         console.print()
     if category is None or category.lower() == "process":
-        matrix_mod.print_process_matrix(console, profiles)
+        matrix_mod.print_process_matrix(console, profiles, cfg)
 
 
 # ---------------------------------------------------------------------------

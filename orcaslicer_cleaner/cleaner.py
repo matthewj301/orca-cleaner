@@ -10,8 +10,35 @@ from rich.console import Console
 
 import re
 
-from .fileops import atomic_write_json, backup_copy, backup_move, create_backup_dir
+from .config import DEFAULT_CONFIG, Config
+from .fileops import (
+    atomic_write_json,
+    backup_copy,
+    backup_move,
+    create_backup_dir,
+    mirror_backup_dir,
+)
 from .models import DuplicateGroup, IssueType, Profile, ProfileCategory, ValidationIssue
+
+# ---------------------------------------------------------------------------
+# Backup mirroring
+# ---------------------------------------------------------------------------
+
+
+def _mirror(console: Console, timestamped_backup: Path, mirror_root: Path | None) -> None:
+    """Copy a completed backup into an extra user-supplied root, if given.
+
+    The real backup already lives under the default `_backup` (what restore/undo
+    read); this is a best-effort additional copy, so a failure only warns.
+    """
+    if mirror_root is None:
+        return
+    dest = mirror_backup_dir(timestamped_backup, mirror_root)
+    if dest is not None:
+        console.print(f"[dim]Also copied backup to: {dest}[/dim]")
+    else:
+        console.print(f"[yellow]Could not copy backup to {mirror_root}[/yellow]")
+
 
 # ---------------------------------------------------------------------------
 # Printer matching helpers
@@ -229,6 +256,7 @@ def execute_actions(
     console: Console,
     actions: list[CleanAction],
     backup_dir: Path,
+    mirror_root: Path | None = None,
 ) -> int:
     """Execute cleanup actions, archiving files to backup_dir first.
 
@@ -251,6 +279,7 @@ def execute_actions(
         except Exception as e:
             console.print(f"  [red]Failed[/red] {action.profile.name}: {e}")
 
+    _mirror(console, timestamped_backup, mirror_root)
     return executed
 
 
@@ -299,6 +328,7 @@ def execute_remap(
     console: Console,
     actions: list[RemapAction],
     backup_dir: Path,
+    mirror_root: Path | None = None,
 ) -> int:
     """Apply remap actions: back up .json files, then rewrite compatible_printers.
 
@@ -371,6 +401,7 @@ def execute_remap(
         except Exception as e:
             console.print(f"  [red]Failed[/red] {path.name}: {e}")
 
+    _mirror(console, timestamped_backup, mirror_root)
     return modified
 
 
@@ -396,7 +427,9 @@ class LinkIssue:
     suggested_printers: list[str]  # what compatible_printers should be
 
 
-def _extract_hardware_hint(profile: Profile, machine_names: set[str]) -> str | None:
+def _extract_hardware_hint(
+    profile: Profile, machine_names: set[str], config: Config = DEFAULT_CONFIG
+) -> str | None:
     """Extract the hardware identifier from a profile name.
 
     Returns None if the profile is generic (no hardware affinity detected).
@@ -420,7 +453,7 @@ def _extract_hardware_hint(profile: Profile, machine_names: set[str]) -> str | N
             if hw_lower in machine.lower():
                 return hw
         # Check aliases
-        for alias_from, alias_to in _HARDWARE_ALIASES.items():
+        for alias_from, alias_to in config.hardware_aliases.items():
             if alias_from in hw_lower:
                 for machine in machine_names:
                     if alias_to in machine.lower():
@@ -443,14 +476,13 @@ def _extract_hardware_hint(profile: Profile, machine_names: set[str]) -> str | N
     return None
 
 
-# Known aliases: hardware terms in profile names that map to machine name terms
-_HARDWARE_ALIASES = {
-    "mako": "bambu",
-    "tk": "teakettle",
-}
+# Hardware aliases (profile-name terms -> machine-name terms) now live in
+# config.hardware_aliases (default {"mako": "bambu", "tk": "teakettle"}).
 
 
-def _machine_matches_hardware(machine_name: str, hardware_hint: str) -> bool:
+def _machine_matches_hardware(
+    machine_name: str, hardware_hint: str, config: Config = DEFAULT_CONFIG
+) -> bool:
     """Check if a machine name is compatible with a hardware hint.
 
     Requires ALL significant hardware tokens from the hint to appear in the
@@ -479,7 +511,7 @@ def _machine_matches_hardware(machine_name: str, hardware_hint: str) -> bool:
         if ht in machine_tokens:
             continue
         # Check if hint token is a known alias for something in the machine
-        alias = _HARDWARE_ALIASES.get(ht)
+        alias = config.hardware_aliases.get(ht)
         if alias and any(alias in mt for mt in machine_tokens):
             continue
         # Check bidirectional substring (handles "Sherpa Mini 8t" vs "Sherpa Mini")
@@ -492,6 +524,7 @@ def _machine_matches_hardware(machine_name: str, hardware_hint: str) -> bool:
 
 def audit_links(
     profiles: dict[ProfileCategory, list[Profile]],
+    config: Config = DEFAULT_CONFIG,
 ) -> list[LinkIssue]:
     """Find filament/process profiles with missing or mismatched compatible_printers."""
     machine_names = {p.name for p in profiles.get(ProfileCategory.MACHINE, [])}
@@ -500,7 +533,7 @@ def audit_links(
 
     for category in (ProfileCategory.FILAMENT, ProfileCategory.PROCESS):
         for profile in profiles.get(category, []):
-            hw_hint = _extract_hardware_hint(profile, machine_names)
+            hw_hint = _extract_hardware_hint(profile, machine_names, config)
             if hw_hint is None:
                 # Generic profile — no hardware affinity, skip
                 continue
@@ -508,7 +541,7 @@ def audit_links(
             # Find which machines match this hardware
             matching_machines = [
                 m for m in machine_list
-                if _machine_matches_hardware(m, hw_hint)
+                if _machine_matches_hardware(m, hw_hint, config)
             ]
 
             current = profile.compatible_printers
@@ -533,7 +566,7 @@ def audit_links(
                 # Check for mismatched entries
                 mismatched = [
                     cp for cp in current
-                    if cp in machine_names and not _machine_matches_hardware(cp, hw_hint)
+                    if cp in machine_names and not _machine_matches_hardware(cp, hw_hint, config)
                 ]
                 if mismatched:
                     issues.append(LinkIssue(
@@ -563,25 +596,23 @@ def _machine_model(machine_name: str) -> str:
 
 # System-preset shorthand that appears in `inherits` values but not in
 # machine model names (e.g. "0.12mm Fine @BBL X1C" should suggest the
-# "Bambu Lab X1 Carbon" machines).
-_MODEL_ALIASES = {
-    "bbl": "bambu lab",
-    "x1c": "x1 carbon",
-    "p1s": "p1s",
-    "u1": "snapmaker u1",
-}
+# "Bambu Lab X1 Carbon" machines) now lives in config.model_aliases
+# (default {"bbl": "bambu lab", "x1c": "x1 carbon", "p1s": "p1s",
+# "u1": "snapmaker u1"}).
 
 
-def _model_tokens_match(text: str, machine_names: list[str]) -> list[str]:
+def _model_tokens_match(
+    text: str, machine_names: list[str], config: Config = DEFAULT_CONFIG
+) -> list[str]:
     """Find machine models whose model segment case-insensitively matches
     (substring, either direction) a token in `text`. Returns matching machine
     NAMES (not models), one entry per matching machine. Tokens are also
-    expanded through _MODEL_ALIASES so system-preset shorthand like
+    expanded through config.model_aliases so system-preset shorthand like
     "@BBL X1C" matches "Bambu Lab X1 Carbon"."""
     text_lower = text.lower()
     raw_tokens = [t for t in re.split(r"[\s@,()/-]+", text_lower) if len(t) >= 2]
     tokens = [t for t in raw_tokens if len(t) >= 3]
-    tokens += [_MODEL_ALIASES[t] for t in raw_tokens if t in _MODEL_ALIASES]
+    tokens += [config.model_aliases[t] for t in raw_tokens if t in config.model_aliases]
     if not tokens:
         return []
 
@@ -597,6 +628,7 @@ def _model_tokens_match(text: str, machine_names: list[str]) -> list[str]:
 
 def find_unassigned(
     profiles: dict[ProfileCategory, list[Profile]],
+    config: Config = DEFAULT_CONFIG,
 ) -> list[UnassignedProfile]:
     """Find filament/process profiles with empty compatible_printers AND no
     hardware hint in their name (i.e. audit_links would not already report
@@ -619,14 +651,14 @@ def find_unassigned(
         for profile in profiles.get(category, []):
             if profile.compatible_printers:
                 continue
-            if _extract_hardware_hint(profile, machine_names) is not None:
+            if _extract_hardware_hint(profile, machine_names, config) is not None:
                 continue
 
             suggestions: list[str] = []
             if profile.inherits:
-                suggestions = _model_tokens_match(profile.inherits, machine_list)
+                suggestions = _model_tokens_match(profile.inherits, machine_list, config)
             if not suggestions:
-                suggestions = _model_tokens_match(profile.name, machine_list)
+                suggestions = _model_tokens_match(profile.name, machine_list, config)
 
             unassigned.append(
                 UnassignedProfile(
@@ -642,6 +674,7 @@ def execute_link_fixes(
     console: Console,
     fixes: list[tuple[Profile, list[str]]],
     backup_dir: Path,
+    mirror_root: Path | None = None,
 ) -> int:
     """Apply compatible_printers fixes. Each fix is (profile, new_printers_list).
 
@@ -681,6 +714,7 @@ def execute_link_fixes(
         except OSError as e:
             console.print(f"  [red]Failed to write[/red] {path.name}: {e}")
 
+    _mirror(console, timestamped_backup, mirror_root)
     return updated
 
 
@@ -724,6 +758,7 @@ def execute_dupe_resolutions(
     console: Console,
     resolutions: list[DupeResolution],
     backup_dir: Path,
+    mirror_root: Path | None = None,
 ) -> int:
     """Apply duplicate-resolution choices: archive losers, optionally merge cp.
 
@@ -774,6 +809,7 @@ def execute_dupe_resolutions(
         except Exception as e:
             console.print(f"  [red]Failed[/red] resolving duplicates for '{resolution.keep.name}': {e}")
 
+    _mirror(console, timestamped_backup, mirror_root)
     return resolved
 
 
@@ -783,6 +819,7 @@ def execute_printer_removal(
     exclusive: list[Profile],
     shared: list[Profile],
     backup_dir: Path,
+    mirror_root: Path | None = None,
 ) -> int:
     """Archive a machine + its exclusive profiles; strip it from shared ones.
 
@@ -830,4 +867,5 @@ def execute_printer_removal(
         except (json.JSONDecodeError, OSError) as e:
             console.print(f"  [red]Failed[/red] {profile.name}: {e}")
 
+    _mirror(console, timestamped_backup, mirror_root)
     return processed

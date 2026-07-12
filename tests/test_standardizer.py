@@ -235,3 +235,50 @@ class TestAppendHardware:
     def test_machine_without_hw_segment_skipped(self):
         # e.g. "Snapmaker U1 - 0.4mm" resolves to no hardware path
         assert self._filament("HTPLA - Protopasta", ["Snapmaker U1 - 0.4mm"]) is None
+
+
+class TestCustomBracketRendering:
+    """Phase 3: name-building honors the configured hardware bracket/separator.
+
+    The key safety property: a format that uses [square] brackets must NOT make
+    the append helper (which looks for a trailing hardware bracket) fail to see
+    an existing [bracket] and corrupt the name by appending a second (paren)."""
+
+    MACHINE_HW = {"Bambu Lab X1 Carbon - Pika - 0.4mm": "Pika - 0.4mm"}
+
+    def _spec(self):
+        from orcaslicer_cleaner.naming import render_spec
+        return render_spec("{material} - {brand} [{hardware}]")
+
+    def _profile(self, name, printers):
+        return Profile(
+            name=name, category=ProfileCategory.FILAMENT, directory=Path("/tmp"),
+            settings={"compatible_printers": printers},
+        )
+
+    def test_append_uses_configured_bracket(self):
+        from orcaslicer_cleaner.standardizer import _append_hardware
+        p = self._profile("PolyTerra PLA - Black", ["Bambu Lab X1 Carbon - Pika - 0.4mm"])
+        assert _append_hardware(p.name, p, self.MACHINE_HW, self._spec()) == (
+            "PolyTerra PLA - Black [Pika - 0.4mm]"
+        )
+
+    def test_existing_square_bracket_not_double_appended(self):
+        # Regression: with a [square] format, a name already ending in [hw]
+        # must be left alone — not get a (paren) tacked on.
+        from orcaslicer_cleaner.standardizer import _append_hardware
+        p = self._profile("PLA - X [Pika - 0.4mm]", ["Bambu Lab X1 Carbon - Pika - 0.4mm"])
+        assert _append_hardware(p.name, p, self.MACHINE_HW, self._spec()) is None
+
+    def test_inject_uses_configured_bracket(self):
+        from orcaslicer_cleaner.standardizer import _inject_hardware
+        p = self._profile("PLA - X [0.4mm]", ["Bambu Lab X1 Carbon - Pika - 0.4mm"])
+        assert _inject_hardware(p, self.MACHINE_HW, self._spec()) == "PLA - X [Pika - 0.4mm]"
+
+    def test_inject_hardware_path_with_backslash_not_interpreted(self):
+        # Defensive: a hardware string with regex-replacement metachars must be
+        # inserted literally, not interpreted by re.sub.
+        from orcaslicer_cleaner.standardizer import _inject_hardware
+        hw = {"M": r"a\1b - 0.4mm"}
+        p = self._profile("PLA - X [0.4mm]", ["M"])
+        assert _inject_hardware(p, hw, self._spec()) == r"PLA - X [a\1b - 0.4mm]"

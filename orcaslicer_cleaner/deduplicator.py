@@ -9,7 +9,9 @@ from itertools import combinations
 
 from rapidfuzz import fuzz
 
+from .config import DEFAULT_CONFIG, Config
 from .models import DuplicateGroup, Profile, ProfileCategory
+from .naming import compile_grammar
 from .standardizer import _normalize_name
 
 
@@ -32,8 +34,6 @@ def recommend_keep(group: DuplicateGroup) -> Profile:
         )
     return group.recommended_keep
 
-# Thresholds
-CONTENT_SIMILARITY_THRESHOLD = 0.95
 
 # ---------------------------------------------------------------------------
 # Variation suffix detection
@@ -99,72 +99,46 @@ def _is_variation_of(name_a: str, name_b: str) -> bool:
 # ---------------------------------------------------------------------------
 # Name parsing for filament and process profiles
 # ---------------------------------------------------------------------------
-
-# Filament: "Material - Brand (Hardware)"
-# e.g. "ABS - Filamentum (LGX Lite Pro - TK - 0.4mm)"
-_FILAMENT_NAME_RE = re.compile(
-    r"^(?P<material>[^-]+?)\s*-\s*(?P<brand>[^(]+?)\s*\((?P<hardware>.+)\)\s*(?P<suffix>.*)$"
-)
-
-# Filament without hardware parenthetical
-_FILAMENT_NAME_NO_HW_RE = re.compile(
-    r"^(?P<material>[^-]+?)\s*-\s*(?P<brand>.+)$"
-)
-
-# Process: "LayerHeight - Purpose (Hardware)"
-# e.g. "0.20mm - Production (LGX Lite Pro - Chube Air - 0.5mm)"
-_PROCESS_NAME_RE = re.compile(
-    r"^(?P<layer_height>\d+\.?\d*mm)\s*-\s*(?P<purpose>[^(]+?)\s*\((?P<hardware>.+)\)\s*(?P<suffix>.*)$"
-)
-
-# Process without hardware parenthetical
-_PROCESS_NAME_NO_HW_RE = re.compile(
-    r"^(?P<layer_height>\d+\.?\d*mm)\s*-\s*(?P<purpose>.+)$"
-)
+#
+# The name grammar (field order + separators) is configurable — parsing is
+# driven by the format templates in config.naming, compiled by naming.py. The
+# default templates reproduce the original hardcoded regexes exactly (verified
+# against a golden corpus of real profile names). Field names are semantic:
+# filament uses {material}/{brand}/{hardware}, process uses
+# {layer}/{purpose}/{hardware}; the dedup checks below key off those roles.
 
 
-def _parse_filament_name(name: str) -> tuple[str, str, str] | None:
-    """Parse a filament name into (material, brand, hardware).
-
-    Returns None if the name doesn't match the expected pattern.
+def _parse_filament_name(
+    name: str, config: Config = DEFAULT_CONFIG
+) -> tuple[str, str, str] | None:
+    """Parse a filament name into (material, brand, hardware), lower-cased and
+    with any variation suffix stripped from the brand. None if it doesn't match.
     """
-    m = _FILAMENT_NAME_RE.match(name)
-    if m:
-        return (
-            m.group("material").strip().lower(),
-            _strip_variation_suffix(m.group("brand").strip()).lower(),
-            m.group("hardware").strip().lower(),
-        )
-    m = _FILAMENT_NAME_NO_HW_RE.match(name)
-    if m:
-        return (
-            m.group("material").strip().lower(),
-            _strip_variation_suffix(m.group("brand").strip()).lower(),
-            "",
-        )
-    return None
+    fields = compile_grammar(config.naming.filament.format).parse(name)
+    if fields is None:
+        return None
+    return (
+        fields.get("material", "").lower(),
+        _strip_variation_suffix(fields.get("brand", "")).lower(),
+        fields.get("hardware", "").lower(),
+    )
 
 
-def _parse_process_name(name: str) -> tuple[str, str, str] | None:
-    """Parse a process name into (layer_height, purpose, hardware).
-
-    Returns None if the name doesn't match the expected pattern.
+def _parse_process_name(
+    name: str, config: Config = DEFAULT_CONFIG
+) -> tuple[str, str, str] | None:
+    """Parse a process name into (layer_height, purpose, hardware), lower-cased
+    and with any variation suffix stripped from the purpose. None if no match.
     """
-    m = _PROCESS_NAME_RE.match(name)
-    if m:
-        return (
-            m.group("layer_height").strip().lower(),
-            _strip_variation_suffix(m.group("purpose").strip()).lower(),
-            m.group("hardware").strip().lower(),
-        )
-    m = _PROCESS_NAME_NO_HW_RE.match(name)
-    if m:
-        return (
-            m.group("layer_height").strip().lower(),
-            _strip_variation_suffix(m.group("purpose").strip()).lower(),
-            "",
-        )
-    return None
+    fields = compile_grammar(config.naming.process.format).parse(name)
+    if fields is None:
+        return None
+    layer = fields.get("layer") or fields.get("layer_height") or ""
+    return (
+        layer.lower(),
+        _strip_variation_suffix(fields.get("purpose", "")).lower(),
+        fields.get("hardware", "").lower(),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -175,6 +149,7 @@ def _parse_process_name(name: str) -> tuple[str, str, str] | None:
 def find_duplicates(
     profiles: dict[ProfileCategory, list[Profile]],
     name_threshold: float = 0,  # kept for CLI compat; unused now
+    config: Config = DEFAULT_CONFIG,
 ) -> list[DuplicateGroup]:
     """Find duplicate profiles across all categories."""
     groups: list[DuplicateGroup] = []
@@ -192,7 +167,7 @@ def find_duplicates(
             groups.extend(_find_exact_dupes(category_profiles))
 
         # Pass 2: variation-based name matching (domain-aware)
-        groups.extend(_find_variation_dupes(category_profiles, category))
+        groups.extend(_find_variation_dupes(category_profiles, category, config))
 
     # Deduplicate groups (a pair might appear in both passes)
     return _merge_groups(groups)
@@ -278,6 +253,7 @@ def _find_exact_dupes(profiles: list[Profile]) -> list[DuplicateGroup]:
 def _find_variation_dupes(
     profiles: list[Profile],
     category: ProfileCategory,
+    config: Config = DEFAULT_CONFIG,
 ) -> list[DuplicateGroup]:
     """Find profiles that are iteration variants of each other.
 
@@ -288,7 +264,7 @@ def _find_variation_dupes(
     groups: list[DuplicateGroup] = []
 
     for a, b in combinations(profiles, 2):
-        is_dup, details = _check_variation_pair(a, b, category)
+        is_dup, details = _check_variation_pair(a, b, category, config)
         if not is_dup:
             continue
 
@@ -296,7 +272,7 @@ def _find_variation_dupes(
         content_sim = _content_similarity(a, b)
         match_type = (
             "content_similar"
-            if content_sim > CONTENT_SIMILARITY_THRESHOLD
+            if content_sim > config.thresholds.content_similarity
             else "name_similar"
         )
 
@@ -313,7 +289,7 @@ def _find_variation_dupes(
 
 
 def _check_variation_pair(
-    a: Profile, b: Profile, category: ProfileCategory
+    a: Profile, b: Profile, category: ProfileCategory, config: Config = DEFAULT_CONFIG
 ) -> tuple[bool, str]:
     """Check if two profiles are variations using domain-aware parsing.
 
@@ -325,22 +301,24 @@ def _check_variation_pair(
 
     # Category-specific structural checks
     if category == ProfileCategory.FILAMENT:
-        return _check_filament_pair(a.name, b.name)
+        return _check_filament_pair(a.name, b.name, config)
     elif category == ProfileCategory.PROCESS:
-        return _check_process_pair(a.name, b.name)
+        return _check_process_pair(a.name, b.name, config)
     else:
         # Machine profiles: just use variation check
         return True, "Name variation detected"
 
 
-def _check_filament_pair(name_a: str, name_b: str) -> tuple[bool, str]:
+def _check_filament_pair(
+    name_a: str, name_b: str, config: Config = DEFAULT_CONFIG
+) -> tuple[bool, str]:
     """Check a filament profile pair.
 
     Only flag if material AND brand AND hardware all match (modulo
     variation suffixes).  Different hardware = NOT a duplicate.
     """
-    pa = _parse_filament_name(name_a)
-    pb = _parse_filament_name(name_b)
+    pa = _parse_filament_name(name_a, config)
+    pb = _parse_filament_name(name_b, config)
 
     if pa is None or pb is None:
         # Can't parse -- fall back to pure variation check (already passed)
@@ -348,38 +326,42 @@ def _check_filament_pair(name_a: str, name_b: str) -> tuple[bool, str]:
 
     a_mat, a_brand, a_hw = pa
     b_mat, b_brand, b_hw = pb
+    t = config.thresholds
 
     # Material must match closely
-    if fuzz.ratio(a_mat, b_mat) < 90:
+    if fuzz.ratio(a_mat, b_mat) < t.fuzz_material:
         return False, ""
 
     # Brand must match closely
-    if fuzz.ratio(a_brand, b_brand) < 90:
+    if fuzz.ratio(a_brand, b_brand) < t.fuzz_brand:
         return False, ""
 
     # Hardware must match exactly (different hardware = different profile)
     if a_hw != b_hw:
         # Allow very minor differences (typos)
-        if fuzz.ratio(a_hw, b_hw) < 95:
+        if fuzz.ratio(a_hw, b_hw) < t.fuzz_hardware:
             return False, ""
 
     return True, f"Filament variation: {a_mat}/{a_brand} ({a_hw})"
 
 
-def _check_process_pair(name_a: str, name_b: str) -> tuple[bool, str]:
+def _check_process_pair(
+    name_a: str, name_b: str, config: Config = DEFAULT_CONFIG
+) -> tuple[bool, str]:
     """Check a process profile pair.
 
     Only flag if layer height AND hardware match, and the purpose
     portion has a variation suffix.
     """
-    pa = _parse_process_name(name_a)
-    pb = _parse_process_name(name_b)
+    pa = _parse_process_name(name_a, config)
+    pb = _parse_process_name(name_b, config)
 
     if pa is None or pb is None:
         return True, "Name variation (unparseable process format)"
 
     a_lh, a_purpose, a_hw = pa
     b_lh, b_purpose, b_hw = pb
+    t = config.thresholds
 
     # Layer height must match exactly
     if a_lh != b_lh:
@@ -387,11 +369,11 @@ def _check_process_pair(name_a: str, name_b: str) -> tuple[bool, str]:
 
     # Hardware must match exactly (different hardware = different profile)
     if a_hw != b_hw:
-        if fuzz.ratio(a_hw, b_hw) < 95:
+        if fuzz.ratio(a_hw, b_hw) < t.fuzz_process_hardware:
             return False, ""
 
     # Purpose must match (after stripping variation suffixes)
-    if fuzz.ratio(a_purpose, b_purpose) < 90:
+    if fuzz.ratio(a_purpose, b_purpose) < t.fuzz_process_purpose:
         return False, ""
 
     return True, f"Process variation: {a_lh}/{a_purpose} ({a_hw})"

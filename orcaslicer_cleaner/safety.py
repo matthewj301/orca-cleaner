@@ -17,17 +17,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+from .config import DEFAULT_CONFIG, Config
 from .models import Profile, ProfileCategory
-
-# Percentage (as a fraction) of a category that must be archived, on top of
-# the absolute floor below, before we warn about a category-wide sweep.
-_CATEGORY_PERCENT_THRESHOLD = 0.15
-# A category sweep must also touch at least this many profiles — otherwise
-# small categories (e.g. 2 of 3) would trip the percentage alone.
-_CATEGORY_ABSOLUTE_FLOOR = 3
-# Total archived profiles in a single operation, regardless of category
-# distribution, that's large enough to warrant a hard confirm on its own.
-_BULK_THRESHOLD = 20
 
 # Sentinel key for profiles with empty compatible_printers ("visible to ALL
 # printers" in OrcaSlicer).
@@ -52,6 +43,7 @@ def assess_blast_radius(
     profiles: dict[ProfileCategory, list[Profile]],
     to_archive: list[Profile],
     to_modify: list[Profile] = (),
+    config: Config = DEFAULT_CONFIG,
 ) -> BlastAssessment:
     """Assess how risky a planned archive/modify operation is.
 
@@ -62,6 +54,7 @@ def assess_blast_radius(
     """
     to_modify = list(to_modify)
     warnings: list[str] = []
+    t = config.thresholds
 
     # 1. Any machine-category profile touched at all.
     touched_machines = sorted(
@@ -90,10 +83,10 @@ def assess_blast_radius(
         total = counts_by_category.get(category, 0)
         if total <= 0:
             continue
-        if archived_count < _CATEGORY_ABSOLUTE_FLOOR:
+        if archived_count < t.blast_category_floor:
             continue
         fraction = archived_count / total
-        if fraction > _CATEGORY_PERCENT_THRESHOLD:
+        if fraction > t.blast_category_pct:
             pct = round(fraction * 100)
             warnings.append(
                 f"archives {archived_count} of {total} {category.value} "
@@ -101,7 +94,7 @@ def assess_blast_radius(
             )
 
     # 3. Total bulk threshold.
-    if len(to_archive) >= _BULK_THRESHOLD:
+    if len(to_archive) >= t.blast_bulk:
         warnings.append(f"archives {len(to_archive)} profiles in one operation")
 
     return BlastAssessment(warnings=warnings)

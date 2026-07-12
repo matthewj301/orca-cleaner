@@ -32,6 +32,13 @@ CLI tool to validate, deduplicate, and clean up OrcaSlicer user profiles.
 - Every mutation backs up to `_backup/` (timestamped dir) BEFORE writing and is
   gated: `clean` requires `--execute`; `fix` and `remove-printer` prompt
   interactively. `ocs restore` is the undo. Archive, never hard-delete.
+- `restore`/`undo` ONLY ever read the default `_backup` (`<profile-dir>/../_backup`).
+  So the default `_backup` is always the canonical store and is written on every
+  backup regardless of flags. `--backup-dir` is an ADDITIONAL mirror, not a
+  replacement (`_resolve_backup_roots` in cli.py returns (primary=`_backup`,
+  mirror); each `execute_*` copies its completed timestamped dir to the mirror
+  via `fileops.mirror_backup_dir`). Mirroring is best-effort — a failed extra
+  copy warns but never aborts the mutation whose real backup succeeded.
 - All backup/write plumbing goes through `fileops.py`: atomic JSON writes
   (temp file + os.replace), collision-free timestamped backup dirs, and a
   per-backup `manifest.json` mapping each backed-up file to its original
@@ -60,7 +67,7 @@ CLI tool to validate, deduplicate, and clean up OrcaSlicer user profiles.
 
 ```
 orcaslicer_cleaner/
-  cli.py          - Click CLI entry point (commands: scan, clean, remove-printer, fix, diff, matrix, restore, undo)
+  cli.py          - Click CLI entry point (commands: scan, clean, remove-printer, fix, diff, matrix, backup, restore, undo, prune-backups)
   models.py       - Data models (Profile, ProfileInfo, ValidationIssue, DuplicateGroup)
   loader.py       - Discovers and parses .info/.json profile pairs from disk
   validators.py   - Validation checks (orphans, broken refs w/ near-match suggestion, stale, malformed JSON)
@@ -71,10 +78,74 @@ orcaslicer_cleaner/
   standardizer.py - Name normalization (layer heights, hyphens, abbreviations, HW injection, machine rename cascade, process model-naming)
   fileops.py      - Atomic JSON writes, timestamped backup dirs, backup manifests w/ operation provenance
   safety.py       - Blast-radius assessment + coverage snapshot/diff for guarding mutations
+  config.py       - TOML user config (vocabulary, thresholds, naming grammar) + defaults
+  naming.py       - Compiles config naming-format templates into name parsers (grammar engine)
   system_profiles.py - Read-only system profile name loader from OrcaSlicer app bundle
 tests/
-  test_standardizer.py, test_machine_matching.py, test_mutations.py - run with `pytest`
+  test_standardizer.py, test_machine_matching.py, test_mutations.py, test_config.py, test_naming.py - run with `pytest`
 ```
+
+## Configuration (config.py)
+
+- `config.py` externalizes what used to be hardcoded, author-specific assumptions:
+  the vocabulary dicts (`abbreviations`, `hardware_aliases`, `model_aliases`),
+  the numeric thresholds (fuzz cutoffs, `stale_days`, blast-radius guards,
+  `diff_match_cutoff`, `unassigned_group_threshold`), and the naming rules
+  (format templates + `pad_layer_heights`/`trim_nozzle_zeros`/`normalize_hyphens`
+  toggles). Loaded from `~/.config/orcaslicer-cleaner/config.toml` or `--config`.
+- INVARIANT (do not weaken): `DEFAULT_CONFIG` reproduces the original hardcoded
+  behavior exactly. The full test suite runs against defaults, so it's the
+  regression net — any wiring that changes default behavior is a bug.
+- Wiring pattern: entry points (`find_duplicates`, `audit_links`, `find_renames`,
+  `find_unassigned`, `assess_blast_radius`, `_normalize_name`) take
+  `config: Config = DEFAULT_CONFIG` and thread it to helpers; the CLI loads once
+  into `ctx.obj["config"]` and passes it down (including through the `_fix_*`
+  helpers). Never read config via module-level globals.
+- Merge semantics: vocabulary sections REPLACE their default wholesale when
+  present (every default entry is personal); `thresholds`/`naming` merge per-key.
+  Unknown/mistyped keys raise `ConfigError` (surfaced as exit code 2) — never
+  silently ignored.
+- STATUS: naming format templates (`[naming.filament].format` etc.) now drive
+  PARSING. `naming.py` compiles a format into a regex parser (`compile_grammar`,
+  lru-cached on the frozen `CategoryNaming`); `deduplicator._parse_filament_name`
+  /`_parse_process_name` and `matrix.py`'s row keys consume it. The default
+  templates reproduce the old hardcoded regexes EXACTLY — verified two ways:
+  `tests/test_naming.py` keeps the original regexes as a reference and asserts
+  parity across a corpus, and a golden run over the real library confirmed
+  byte-for-byte parity. Field names are semantic: filament {material}/{brand}/
+  {hardware}, process {layer}/{purpose}/{hardware}; {layer}/{nozzle} must match
+  `\d+\.?\d*mm`; {hardware} is a single greedy blob on parse (its sub-template is
+  render-only). Compiler quirk faithfully reproduced: the last field is greedy
+  (hardware captures to the LAST `)`), generic fields exclude their delimiter
+  char, a pure-whitespace separator compiles to `\s+` (not `\s*`).
+- RENDER side (partial): `naming.render_spec(fmt)` extracts the separator and
+  hardware-bracket literals (`RenderSpec`, lru-cached) from a format template.
+  `standardizer.py`'s name-building — `_append_hardware`, `_inject_hardware`,
+  `_normalize_filament_paren`, `_normalize_process_paren` — is parameterized by a
+  `RenderSpec` (default `_DEFAULT_FIL_SPEC`/`_DEFAULT_PROC_SPEC` reproduce the
+  built-in convention), so `fix --only names` honors a configured separator and
+  hardware bracket. Verified: default config reproduces the exact rename set on
+  the real library byte-for-byte (golden `rename_baseline`), and a `[square]`
+  format both prevents corruption (no stray `(paren)` appended to an existing
+  `[bracket]`) and injects/normalizes into `[brackets]` — see
+  `tests/test_standardizer.py::TestCustomBracketRendering`.
+- SAFETY RAIL (do not weaken): `naming.validate_renderable(fmt)`, run at config
+  load, rejects any format whose `{hardware}` field can't be built into a
+  re-detectable single-character bracket — via a round-trip check (append with
+  the spec, then require the spec's own detector to match). This blocks two
+  name-corrupting classes at the source: a hardware field with no bracket
+  (glues hardware on with no delimiter, regrows every run) and a multi-character
+  bracket (single-char detector can't re-find it). `RenderSpec.has_hardware` is
+  True only when a usable single-char bracket exists, so the render helpers also
+  no-op defensively. `execute_renames` threads the machine separator + process
+  RenderSpec into `_broaden_process_printers` so broadening works under a custom
+  machine-name separator too.
+- STILL TODO: full field REORDERING during standardization. The standardizer does
+  targeted surgical edits (spacing, nozzle sizes, brackets), not parse→render, so
+  it won't rewrite a name into a wholly different field order. A full
+  parse→transform→render pipeline (using the `hardware` sub-template) would be the
+  next step — deferred because the real-library evidence shows standardization is
+  in-place tidying, making a full rewrite high-risk for low incremental value.
 
 ## OrcaSlicer Profile Format
 
@@ -119,6 +190,10 @@ ocs matrix                                  # read-only coverage matrix (filamen
 ocs matrix --category filament              # material/brand x machine matrix only
 ocs diff "Profile A" "Profile B"            # compare two profiles; fuzzy "did you mean?" on miss
 ocs diff --category process A B             # disambiguate names that exist in multiple categories
+ocs backup                                  # snapshot the ENTIRE library into a timestamped _backup/
+                                            #   dir (copy-only, safe while OrcaSlicer is open; restore
+                                            #   with 'ocs restore'). --backup-dir ADDS a mirror copy
+                                            #   (default _backup is always written so restore finds it)
 ocs undo                                    # restore the most recent backup (undo last operation)
 ocs restore                                 # list available backups (shows which operation made each)
 ocs restore 20260425_1104                   # restore a backup (timestamp prefix match ok)
@@ -128,7 +203,9 @@ ocs prune-backups --keep 20                 # preview deletion of old timestampe
 ```
 
 Global flags `--profile-dir` / `--system-profiles` override the default paths;
-`clean` and `fix` accept `--backup-dir`; `restore --force` skips confirmation.
+`clean`, `fix`, `remove-printer`, and `backup` accept `--backup-dir` (an
+additional mirror; the default `_backup` is always written); `restore --force`
+skips confirmation. `restore` has no `--backup-dir` — it always reads `_backup`.
 
 ## Domain Model
 

@@ -2,7 +2,12 @@
 
 A command-line tool for tidying up and keeping track of your OrcaSlicer profiles.
 
-I built this for my own setup — 7 printers, 300+ profiles, years of "I'll clean this up later" accumulation. If you've got a similar mess of stale profiles, broken references, duplicate filaments with `-beta-v2-final-FINAL` suffixes, and profiles showing up under the wrong printer... this might help you too. Or at least give you a starting point to tweak for your own needs.
+I decided to build this after the profile bloat finally got unmanageable
+(7 printers, 300+ profiles, countless "prod" profiles).
+If you've got a similar mess of stale profiles, broken references,
+duplicate filaments with `-beta-v2-final` suffixes,
+and profiles showing up under the wrong printer... this might help you too.
+Or at least give you a starting point to tweak for your own needs.
 
 ## What it does
 
@@ -31,7 +36,7 @@ pip install -e .
 
 ## Trying it out
 
-The friendliest way to start is to just look. `scan` reads your profiles and reports back — it never changes anything, so you can run it as often as you like:
+The easiest way to start by taking a look at what it finds. `scan` reads your profiles and reports back — it never changes anything, so you can run it as often as you like:
 
 ```bash
 ocs scan
@@ -39,7 +44,7 @@ ocs scan
 
 You'll get a summary of anything that looks off: profiles pointing at printers you no longer have, near-duplicates, naming that's drifted over the years, and so on.
 
-When you're ready to make changes, take a snapshot first so you can always get back to where you started:
+When you're ready to make changes, take a backup first so you can always get back to where you started:
 
 ```bash
 ocs backup
@@ -51,7 +56,7 @@ Then quit OrcaSlicer (see the note just below) and try a guided fix. `fix` walks
 ocs fix
 ```
 
-Changed your mind? `ocs restore` brings a snapshot back. There's no step here you can't undo.
+Changed your mind? `ocs restore` helps you restore your backup - it will list them out and ask you which one you want to restore. All steps are reversible.
 
 ## Before you make changes: quit OrcaSlicer
 
@@ -60,8 +65,9 @@ OrcaSlicer keeps its profiles in sync with its cloud account, and it doesn't exp
 Looking and copying are always fine. `scan`, `diff`, and `backup` only read (or copy) your files, so you're welcome to run them with OrcaSlicer open. It's only the commands that change things — `fix`, `clean`, `remove-printer` — that need the app closed.
 
 > **⚠️ Windows and Linux users, please read this.** This tool was built and tested on macOS. Two things matter for you:
+>
 > - **The default profile paths are macOS-only.** You must point the tool at your own OrcaSlicer folders with `--profile-dir` (and usually `--system-profiles`) on every command — for example `ocs --profile-dir "C:\Users\you\AppData\Roaming\OrcaSlicer\user" scan`.
-> - **The automatic "is OrcaSlicer running?" safety check only works on macOS.** On Windows/Linux it can't detect the app, so the tool will *not* stop you from editing profiles while OrcaSlicer is open. That's exactly the situation that can make OrcaSlicer delete profiles. **You must quit OrcaSlicer yourself before running any command that changes profiles**, and take a `backup` first. Cross-platform support for this guard is planned.
+> - **The automatic "is OrcaSlicer running?" safety check only works on macOS.** On Windows/Linux it can't detect the app, so the tool will _not_ stop you from editing profiles while OrcaSlicer is open. That's exactly the situation that can make OrcaSlicer delete profiles. **You must quit OrcaSlicer yourself before running any command that changes profiles**, and take a `backup` first. Cross-platform support for this guard is planned.
 
 ## Usage
 
@@ -113,18 +119,19 @@ Want a second copy somewhere else — an external drive, or a folder you back up
 ocs backup --backup-dir /Volumes/Backup/orca
 ```
 
-Your backup still lands in the usual `_backup/` folder, so `ocs restore` can always find it, and a matching copy is placed in the location you chose as well.
+Your backup is still placed in the usual `_backup/` folder, so `ocs restore` can find it, and a matching copy is placed in the location you chose as well.
 
-## How profiles work (for the curious)
+## How profiles work
 
 Each OrcaSlicer profile is a pair of files — `Name.info` (metadata) and `Name.json` (settings). They live in `<user_dir>/<user_id>/{filament,machine,process}/`.
 
 The tool understands the domain model:
+
 - **Filament profiles** are hardware-specific — tuned for a particular extruder + hotend combo. Same material through different hardware = different profile.
 - **Process profiles** define how the machine moves — generally filament-agnostic but printer-specific.
 - **Machine profiles** define the printer itself.
 
-This matters for duplicate detection. Two filament profiles with the same material but different hardware in their names are *not* duplicates, even if the names are similar.
+This matters for duplicate detection. Two filament profiles with the same material but different hardware in their names are _not_ duplicates, even if the names are similar.
 
 ## Naming conventions
 
@@ -138,9 +145,9 @@ Your naming doesn't have to match exactly — the tool does its best with whatev
 
 ## Configuration
 
-The tool ships with defaults tuned for the author's setup — including a few personal shorthands (like "TK" meaning "TeaKettle"). You can point those at your own gear with a config file. It's completely optional: without one, everything uses the built-in defaults.
+The tool ships with defaults from my setup — including some personal shorthands (like "TK" meaning "TeaKettle"). You can tweak to your own standards or conventions with a config file. Completely optional: without one, everything uses the built-in defaults.
 
-Create `~/.config/orcaslicer-cleaner/config.toml` (or pass `--config path/to/config.toml`). Anything you leave out keeps its default, so you only need to write the parts you want to change. There's a fully-commented starting point in [`config.toml.example`](config.toml.example) — copy it and edit.
+Create `~/.config/orcaslicer-cleaner/config.toml` (or pass `--config path/to/config.toml`). Anything you leave out keeps its default, so you only need to write the parts you want to change. There's a fully-commented starting point in [`config.toml.example`](config.toml.example)
 
 The most useful thing to personalize is the **vocabulary** — the shorthands you use in profile names:
 
@@ -163,7 +170,7 @@ format = "{brand} {material} [{hardware}]"
 
 And you can adjust the numeric thresholds (how strict duplicate-matching is, how many days counts as "stale", and so on) or turn individual naming cleanups on or off. See the example file for the full list with explanations.
 
-(One note: a custom format changes how the tool *understands* your names, and when tidying names with `ocs fix --only names` it uses your separator and hardware bracket — so if you write hardware in `[square]` brackets, it keeps them square. Fully reordering fields into a different layout during tidying isn't done yet.)
+(One note: a custom format changes how the tool _understands_ your names, and when tidying names with `ocs fix --only names` it uses your separator and hardware bracket — so if you write hardware in `[square]` brackets, it keeps them square. Fully reordering fields into a different layout during tidying isn't done yet.)
 
 If you mistype a setting, the tool tells you rather than quietly ignoring it.
 

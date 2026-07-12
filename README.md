@@ -58,6 +58,12 @@ ocs fix
 
 Changed your mind? `ocs restore` helps you restore your backup - it will list them out and ask you which one you want to restore. All steps are reversible.
 
+## Using AI agents to tweak this for you
+- I built this with the help of Claude Code, and because of that their is a CLAUDE.md file in the repo. 
+- Any agent (not just Claude) can read it and hit the ground running
+- You can then point it at your orcaslicer install folder, and have it help you either edit this to match your needs, 
+or update the config file to get the behavior you're looking for
+
 ## Before you make changes: quit OrcaSlicer
 
 OrcaSlicer keeps its profiles in sync with its cloud account, and it doesn't expect them to change while it's open. If a profile file changes underneath the running app, OrcaSlicer can treat it as a conflict and remove the profile. To prevent that, anything that edits your profiles will pause and ask you to quit OrcaSlicer first.

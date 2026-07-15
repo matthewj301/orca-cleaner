@@ -236,6 +236,14 @@ skips confirmation. `restore` has no `--backup-dir` — it always reads `_backup
   is installed. A process profile applies to ALL hardware variants of a printer model.
   Naming convention: `<layer>mm - <purpose> (<PrinterModel> - <NozzleSize>)`
 - Machine profiles define the printer with hardware: "PrinterModel - Extruder - Hotend - NozzleSize"
+- EXCEPTION — toolchangers: a printer whose tools each run a different nozzle is
+  ONE machine named with NO nozzle suffix (e.g. `Snapmaker U1`); the per-tool
+  nozzle lives in the filament/process names (`U1 Hotend - 0.4mm`, `U1 - 0.5mm`).
+  Do not append a nozzle to such a machine or split it per-nozzle. Link matching
+  handles the mismatch: `_machine_matches_hardware` resolves a hardware chunk's
+  identifier WORD through `config.model_aliases` (`u1 -> snapmaker u1`), so a
+  role-noun like "Hotend" no longer blocks the match and any per-tool nozzle
+  resolves to the single machine.
 
 ## Off-disk backup
 
@@ -254,8 +262,13 @@ launchd agent `com.mjohnson.orcaslicer-backup` (plist staged in that repo's
 
 ## Extension Points
 
-- Hardware aliases (cleaner.py `_HARDWARE_ALIASES`): maps abbreviations in profile
-  names to machine name terms for link matching (e.g., "mako" -> "bambu")
+- Hardware aliases (`config.hardware_aliases`, default `{"mako": "bambu",
+  "tk": "teakettle"}`): maps abbreviations in profile names to machine name terms
+  for link matching (e.g., "mako" -> "bambu").
+- Model aliases (`config.model_aliases`, default includes `"u1": "snapmaker u1"`):
+  ALSO consulted by `_machine_matches_hardware` at the word level, so a plain
+  model name matches a hardware chunk that carries a role noun or nozzle (see the
+  toolchanger exception in Domain Model).
 - Name abbreviations (standardizer.py `_ABBREVIATIONS`): expanded during name
   standardization (e.g., "TK" -> "TeaKettle")
 

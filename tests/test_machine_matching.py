@@ -100,6 +100,38 @@ class TestAliases:
         )
 
 
+class TestModelAliasResolution:
+    """A hardware chunk whose identifier word is a model alias resolves to the
+    plain-model machine name, even when a role noun ('Hotend') blocks the
+    substring path. Regression for the Snapmaker U1 filament orphan false-positive.
+    """
+
+    def test_u1_hotend_matches_plain_snapmaker(self):
+        # Live machine is named just "Snapmaker U1" (no hardware/nozzle suffix);
+        # filaments carry "(U1 Hotend - 0.4mm)". model_aliases: u1 -> snapmaker u1.
+        assert _machine_matches_hardware("Snapmaker U1", "U1 Hotend - 0.4mm")
+
+    def test_u1_hotend_matches_suffixed_snapmaker(self):
+        assert _machine_matches_hardware("Snapmaker U1 - 0.40mm", "U1 Hotend - 0.4mm")
+
+    def test_u1_hotend_rejects_non_snapmaker(self):
+        for machine in MACHINES:
+            if "Snapmaker" not in machine:
+                assert not _machine_matches_hardware(machine, "U1 Hotend - 0.4mm")
+
+    def test_u1_toolchanger_any_per_tool_nozzle_matches_one_machine(self):
+        # The U1 is a toolchanger: each tool can run a different nozzle, so the
+        # nozzle lives in the filament/process name, not the (single) machine
+        # name. Every per-tool nozzle must resolve to the one "Snapmaker U1".
+        for hint in (
+            "U1 Hotend - 0.4mm",
+            "U1 Hotend - 0.5mm",
+            "U1 Hotend - 0.6mm",
+            "U1 - 0.5mm",
+        ):
+            assert _machine_matches_hardware("Snapmaker U1", hint), hint
+
+
 class TestDirectSubstring:
     """Direct substring match (simplest case)."""
 

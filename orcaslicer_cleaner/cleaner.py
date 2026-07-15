@@ -517,6 +517,20 @@ def _machine_matches_hardware(
         # Check bidirectional substring (handles "Sherpa Mini 8t" vs "Sherpa Mini")
         if any(ht in mt or mt in ht for mt in machine_tokens):
             continue
+        # Resolve an identifier WORD within the chunk via the alias maps. A
+        # multi-word chunk like "u1 hotend" won't substring-match a plain model
+        # name ("Snapmaker U1"), but its identifying word ("u1") is a known
+        # model alias for that machine. Match if any word in the chunk aliases
+        # (hardware or model) to text present in the machine name.
+        if any(
+            target and target in machine_lower
+            for word in ht.split()
+            for target in (
+                config.hardware_aliases.get(word),
+                config.model_aliases.get(word),
+            )
+        ):
+            continue
         return False
 
     return True
